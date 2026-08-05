@@ -502,7 +502,7 @@ emit_work() {
   jq -rs --arg suffix "$suffix" '
     def clean: tostring | gsub("[\u0000-\u001f\u007f]+"; " ") | gsub("\u2063"; "") | gsub("  +"; " ") | gsub("^ +| +$"; "");
     def rank: if .priority == "high" then 0 elif .priority == "medium" then 1 else 2 end;
-    unique_by([.kind,.project,.headline,.action,.consequence]) as $all |
+    (group_by(.identity) | map(max_by(.date))) as $all |
     [$all[] | select(.kind == "job")] as $jobs |
     [$all[] | select(.kind == "captain")] as $captain |
     "OVERNIGHT GITHUB WORK\n\n" +
@@ -606,7 +606,17 @@ collect() {
       case "$verdict" in
         live)
           day_live=1
-          printf '%s' "$row" | jq -c --arg date "$day" '{kind,project,repository,date:$date,headline:.item.headline,action:.item.action,consequence:.item.consequence,priority:(.item.priority // "medium")}' >> "$day_survivors"
+          printf '%s' "$row" | jq -c --arg date "$day" '{
+            kind,
+            project,
+            repository,
+            date:$date,
+            identity:{kind,repository,references:(.item.references | map(.url) | sort),evidence_event_ids:(.item.evidence_event_ids | sort)},
+            headline:.item.headline,
+            action:.item.action,
+            consequence:.item.consequence,
+            priority:(.item.priority // "medium")
+          }' >> "$day_survivors"
           ;;
         error)
           day_error=1
@@ -626,7 +636,17 @@ collect() {
       case "$verdict" in
         live)
           day_live=1
-          printf '%s' "$row" | jq -c --arg date "$day" '{kind,project,repository,date:$date,headline:.item.headline,action:.item.action,consequence:.item.consequence,priority:"high"}' >> "$day_survivors"
+          printf '%s' "$row" | jq -c --arg date "$day" '{
+            kind,
+            project,
+            repository,
+            date:$date,
+            identity:{kind,repository,references:(.item.references | map(.url) | sort),evidence_event_ids:(.item.evidence_event_ids | sort)},
+            headline:.item.headline,
+            action:.item.action,
+            consequence:.item.consequence,
+            priority:"high"
+          }' >> "$day_survivors"
           ;;
         error)
           day_error=1

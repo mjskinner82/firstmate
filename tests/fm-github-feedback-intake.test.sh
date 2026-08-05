@@ -8,6 +8,7 @@
 #   - GET-side 404 remains distinct from an unexpected response
 #   - malformed or unsafe cards are rejected without advancing review state
 #   - current-date cards are included and normalized-empty prose is rejected
+#   - deduplication follows stable evidence identity rather than display prose
 #   - every unreviewed date is fetched and surfaced together
 #   - current resolved-thread state drops stale card work silently
 #   - acknowledgment records exactly the dates from actionable output
@@ -363,6 +364,39 @@ EOF
   pass 'multiple unread days are grouped into one dispatchable review and acknowledged exactly'
 }
 
+test_deduplication_uses_evidence_identity() {
+  local record dir fakebin out occurrences
+  record=$(make_world evidence-dedup)
+  IFS='|' read -r dir fakebin <<EOF
+$record
+EOF
+  write_ready_card "$dir/cards/2026-08-04.json" 2026-08-04 'Identity Project' 'owner/identity' \
+    'Old wording' 'Apply the shared correction.' 'The shared consequence remains.' \
+    'https://github.com/owner/identity/pull/81' 'PRC_shared'
+  write_ready_card "$dir/cards/2026-08-05.json" 2026-08-05 'Identity Project' 'owner/identity' \
+    'New wording' 'Apply the shared correction.' 'The shared consequence remains.' \
+    'https://github.com/owner/identity/pull/81' 'PRC_shared'
+  jq '.projects[0].work_items += [{
+    headline:"New wording",
+    action:"Apply the shared correction.",
+    consequence:"The shared consequence remains.",
+    priority:"high",
+    status:"live",
+    status_reason:null,
+    references:[{label:"source",url:"https://github.com/owner/identity/pull/82"}],
+    evidence_event_ids:["PRC_distinct"]
+  }]' "$dir/cards/2026-08-05.json" > "$dir/cards/2026-08-05.updated.json"
+  mv "$dir/cards/2026-08-05.updated.json" "$dir/cards/2026-08-05.json"
+  write_pr_state "$dir/gh/owner--identity--81.out" $'PR\tOPEN\tfalse\tfalse\tfalse'
+  write_pr_state "$dir/gh/owner--identity--82.out" $'PR\tOPEN\tfalse\tfalse\tfalse'
+
+  out=$(run_intake "$dir" "$fakebin" 2026-08-05)
+  assert_not_contains "$out" 'Old wording' 'older wording survived for the same evidence identity'
+  occurrences=$(printf '%s\n' "$out" | grep -Fc -- '- New wording')
+  [ "$occurrences" -eq 2 ] || fail "distinct evidence identities did not both survive: $occurrences"
+  pass 'deduplication keeps newest prose per stable evidence identity'
+}
+
 test_resolved_thread_is_dropped_silently() {
   local record dir fakebin out
   record=$(make_world stale-thread)
@@ -391,6 +425,7 @@ test_unsafe_prose_is_rejected_without_echo
 test_current_date_card_is_included
 test_normalized_empty_prose_is_rejected
 test_multiple_unreviewed_days_surface_and_acknowledge
+test_deduplication_uses_evidence_identity
 test_resolved_thread_is_dropped_silently
 
 echo '# fm-github-feedback-intake.test.sh: all assertions passed'
