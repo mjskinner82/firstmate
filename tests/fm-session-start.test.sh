@@ -1488,7 +1488,7 @@ run_session_start_with_github_feedback() {
   FM_FAKE_HARNESS_PID=$$ \
     FM_GITHUB_FEEDBACK_DISABLED=0 \
     FM_GITHUB_FEEDBACK_EPOCH=2026-08-04 \
-    FM_GITHUB_FEEDBACK_TODAY=2026-08-05 \
+    FM_GITHUB_FEEDBACK_TODAY=2026-08-04 \
     FM_GITHUB_FEEDBACK_BASE_URL=https://fixture.invalid/github-feedback \
     FM_TEST_FEEDBACK_CARD="$home/card.json" \
     run_session_start "$home" "$root" "$fakebin:$BASE_PATH"

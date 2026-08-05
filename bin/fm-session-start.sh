@@ -115,8 +115,9 @@
 # check, the harness override, crew-dispatch validation, tasks-axi and quota-axi
 # tool checks, and tasks-axi availability - none of which mutate shared state
 # and all of which are safe to compute without verified lock ownership.
-# It deliberately skips the network-only GitHub-auth probe because a read-only
-# session has no dispatch, spawn, steer, or merge action for that verdict to gate.
+# It deliberately skips GitHub authentication and retained feedback intake
+# because a read-only session has no dispatch, spawn, steer, or merge action
+# for those network verdicts to gate.
 # Only projection cleanup, the six bootstrap mutating sweeps, and the
 # wake-queue drain are skipped.
 # The context and fleet-state digests
