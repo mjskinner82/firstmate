@@ -4,6 +4,8 @@
 # Coverage:
 #   - a transport failure is visible and cannot be mistaken for a quiet day
 #   - transport failure on one date does not suppress later retained dates
+#   - route-wide failure is bounded by the aggregate intake deadline
+#   - GET-side 404 remains distinct from an unexpected response
 #   - malformed or unsafe cards are rejected without advancing review state
 #   - every unreviewed date is fetched and surfaced together
 #   - current resolved-thread state drops stale card work silently
@@ -27,6 +29,7 @@ make_world() {
 set -u
 output=
 url=
+is_head=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --output)
@@ -36,6 +39,7 @@ while [ $# -gt 0 ]; do
     --write-out|--connect-timeout|--max-time)
       shift
       ;;
+    --head) is_head=1 ;;
     http://*|https://*) url=$1 ;;
   esac
   shift
@@ -43,9 +47,22 @@ done
 day=$(printf '%s\n' "$url" | sed -nE 's#.*/([0-9]{4}-[0-9]{2}-[0-9]{2})/card\.json$#\1#p')
 [ -n "$day" ] || exit 22
 printf '%s\n' "$day" >> "${FM_TEST_CURL_LOG:?}"
+if [ "${FM_TEST_FETCH_FAIL_ALL:-0}" = 1 ]; then
+  /bin/sleep 1.2
+  printf '%s\n' 'fixture route failure' >&2
+  exit 7
+fi
 if [ "${FM_TEST_FETCH_FAIL_DATE:-}" = "$day" ]; then
   printf '%s\n' 'fixture transport failure' >&2
   exit 7
+fi
+if [ "${FM_TEST_GET_404_DATE:-}" = "$day" ]; then
+  if [ "$is_head" -eq 1 ]; then
+    printf '200'
+  else
+    printf '404'
+  fi
+  exit 0
 fi
 card="${FM_TEST_CARD_DIR:?}/$day.json"
 if [ ! -f "$card" ]; then
@@ -142,6 +159,7 @@ run_intake() {
     FM_GITHUB_FEEDBACK_BASE_URL='https://fixture.invalid/github-feedback' \
     FM_GITHUB_FEEDBACK_EPOCH=2026-08-04 \
     FM_GITHUB_FEEDBACK_TODAY="$today" \
+    FM_GITHUB_FEEDBACK_TOTAL_TIMEOUT="${FM_TEST_TOTAL_TIMEOUT:-20}" \
     FM_GITHUB_FEEDBACK_DISABLED=0 \
     FM_TEST_CARD_DIR="$dir/cards" \
     FM_TEST_GH_DIR="$dir/gh" \
@@ -187,6 +205,35 @@ EOF
   pass 'transport failure does not suppress later retained dates'
 }
 
+test_route_failure_respects_total_timeout() {
+  local record dir fakebin out calls
+  record=$(make_world route-timeout)
+  IFS='|' read -r dir fakebin <<EOF
+$record
+EOF
+
+  out=$(FM_TEST_FETCH_FAIL_ALL=1 FM_TEST_TOTAL_TIMEOUT=1 run_intake "$dir" "$fakebin" 2026-08-08)
+  assert_contains "$out" 'could not be fully fetched within the available time' 'aggregate timeout was not reported'
+  calls=$(wc -l < "$dir/curl.log" | tr -d ' ')
+  [ "$calls" -le 2 ] || fail "aggregate timeout allowed too many route attempts: $calls"
+  assert_absent "$dir/home/state/github-feedback-reviewed-dates" 'route timeout advanced the review record'
+  pass 'route-wide failure is bounded by the aggregate deadline'
+}
+
+test_get_404_is_reported_distinctly() {
+  local record dir fakebin out
+  record=$(make_world get-404)
+  IFS='|' read -r dir fakebin <<EOF
+$record
+EOF
+
+  out=$(FM_TEST_GET_404_DATE=2026-08-04 run_intake "$dir" "$fakebin" 2026-08-05)
+  assert_contains "$out" 'no completed overnight work was available for this date' 'GET-side 404 was not reported as missing input'
+  assert_not_contains "$out" 'unexpected response' 'GET-side 404 was misclassified as unexpected'
+  assert_absent "$dir/home/state/github-feedback-reviewed-dates" 'GET-side 404 advanced the review record'
+  pass 'GET-side 404 is distinct from an unexpected response'
+}
+
 test_invalid_card_is_not_reviewed() {
   local record dir fakebin out
   record=$(make_world invalid-card)
@@ -206,6 +253,26 @@ EOF
   assert_absent "$dir/home/state/github-feedback-reviewed-dates" 'malformed card advanced the review record'
   assert_absent "$dir/home/state/github-feedback-pending-dates" 'malformed card became actionable'
   pass 'malformed nested card is rejected without review acknowledgment'
+}
+
+test_empty_ready_card_is_not_reviewed() {
+  local record dir fakebin out
+  record=$(make_world empty-ready-card)
+  IFS='|' read -r dir fakebin <<EOF
+$record
+EOF
+  jq -n '{
+    schema_version:"github-feedback-card.v1",
+    card_date:"2026-08-04",
+    status:"ready",
+    projects:[],
+    captain_needed:[]
+  }' > "$dir/cards/2026-08-04.json"
+
+  out=$(run_intake "$dir" "$fakebin" 2026-08-05)
+  assert_contains "$out" 'did not match the required complete-card contract' 'empty ready card was not reported as invalid'
+  assert_absent "$dir/home/state/github-feedback-reviewed-dates" 'empty ready card advanced the review record'
+  pass 'empty ready card is rejected without review acknowledgment'
 }
 
 test_unsafe_prose_is_rejected_without_echo() {
@@ -247,7 +314,8 @@ EOF
   assert_contains "$out" 'Repair the release check' 'oldest unread job was not surfaced'
   assert_contains "$out" 'Beta Project' 'newer unread project was not surfaced'
   assert_contains "$out" 'Keep narrow navigation readable' 'newer unread job was not surfaced'
-  assert_contains "$out" 'Resolve each through the normal project workflow before marking this review complete' 'actionable output lacked the normal-lifecycle completion instruction'
+  assert_contains "$out" 'Every item above remains current and needs resolution' 'actionable output lacked outcome-only resolution wording'
+  assert_not_contains "$out" 'workflow' 'actionable output exposed internal workflow mechanics'
   assert_contains "$(cat "$dir/home/state/github-feedback-pending-dates")" '2026-08-04' 'oldest actionable date was not pending'
   assert_contains "$(cat "$dir/home/state/github-feedback-pending-dates")" '2026-08-05' 'newer actionable date was not pending'
 
@@ -279,7 +347,10 @@ EOF
 
 test_fetch_failure_is_not_quiet
 test_transport_failure_does_not_stop_catchup
+test_route_failure_respects_total_timeout
+test_get_404_is_reported_distinctly
 test_invalid_card_is_not_reviewed
+test_empty_ready_card_is_not_reviewed
 test_unsafe_prose_is_rejected_without_echo
 test_multiple_unreviewed_days_surface_and_acknowledge
 test_resolved_thread_is_dropped_silently

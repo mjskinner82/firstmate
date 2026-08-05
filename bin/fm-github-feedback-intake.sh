@@ -31,6 +31,7 @@
 #   FM_GITHUB_FEEDBACK_TODAY
 #   FM_GITHUB_FEEDBACK_FETCH_TIMEOUT
 #   FM_GITHUB_FEEDBACK_GH_TIMEOUT
+#   FM_GITHUB_FEEDBACK_TOTAL_TIMEOUT
 #   FM_GITHUB_FEEDBACK_DISABLED=1
 # shellcheck disable=SC2016 # Node, GraphQL, and jq programs are intentionally literal.
 set -u
@@ -45,6 +46,7 @@ EPOCH=${FM_GITHUB_FEEDBACK_EPOCH:-2026-08-04}
 TODAY=${FM_GITHUB_FEEDBACK_TODAY:-$(TZ=America/Los_Angeles date +%F)}
 FETCH_TIMEOUT=${FM_GITHUB_FEEDBACK_FETCH_TIMEOUT:-8}
 GH_TIMEOUT=${FM_GITHUB_FEEDBACK_GH_TIMEOUT:-8}
+TOTAL_TIMEOUT=${FM_GITHUB_FEEDBACK_TOTAL_TIMEOUT:-20}
 REVIEWED="$STATE/github-feedback-reviewed-dates"
 PENDING="$STATE/github-feedback-pending-dates"
 
@@ -177,6 +179,17 @@ bounded() {
   fi
 }
 
+remaining_timeout() {
+  local maximum=$1 remaining
+  remaining=$((DEADLINE - $(date +%s)))
+  [ "$remaining" -gt 0 ] || return 1
+  if [ "$remaining" -lt "$maximum" ]; then
+    printf '%s\n' "$remaining"
+  else
+    printf '%s\n' "$maximum"
+  fi
+}
+
 decode_gh_axi_body() {
   local input=$1 body truncated
   truncated=$(sed -n 's/^  truncated: //p' "$input" | head -n 1)
@@ -198,7 +211,7 @@ cache_key() {
 }
 
 query_pull_request() {
-  local owner=$1 repo=$2 number=$3 cache=$4 output rc query filter
+  local owner=$1 repo=$2 number=$3 cache=$4 output rc query filter request_timeout
   [ -f "$cache" ] && return 0
   [ ! -e "$TMP/github-unavailable" ] || return 1
   query='query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){state merged reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved isOutdated comments(first:100){pageInfo{hasNextPage} nodes{id isMinimized}}}} commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{__typename ... on CheckRun{id status conclusion}}}}}}}}}}'
@@ -214,7 +227,8 @@ query_pull_request() {
         select(.__typename == "CheckRun") | ["CHECK",.id,.status,(.conclusion // "")]|@tsv)
     end'
   output="$TMP/gh-pr-$(cache_key "$owner/$repo/$number").out"
-  if bounded "$GH_TIMEOUT" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
+  request_timeout=$(remaining_timeout "$GH_TIMEOUT") || return 1
+  if bounded "$request_timeout" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
     gh-axi api POST graphql \
       --field "query=$query" \
       --field "owner=$owner" \
@@ -233,13 +247,14 @@ query_pull_request() {
 }
 
 query_issue() {
-  local owner=$1 repo=$2 number=$3 cache=$4 output rc query filter
+  local owner=$1 repo=$2 number=$3 cache=$4 output rc query filter request_timeout
   [ -f "$cache" ] && return 0
   [ ! -e "$TMP/github-unavailable" ] || return 1
   query='query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){issue(number:$number){state}}}'
   filter='.data.repository.issue as $i | if $i == null then "MISSING" else ["ISSUE",$i.state]|@tsv end'
   output="$TMP/gh-issue-$(cache_key "$owner/$repo/$number").out"
-  if bounded "$GH_TIMEOUT" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
+  request_timeout=$(remaining_timeout "$GH_TIMEOUT") || return 1
+  if bounded "$request_timeout" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
     gh-axi api POST graphql \
       --field "query=$query" \
       --field "owner=$owner" \
@@ -374,10 +389,11 @@ EOF
 }
 
 fetch_card() {
-  local day=$1 destination=$2 errors=$3 url code rc
+  local day=$1 destination=$2 errors=$3 url code rc request_timeout
   url="${BASE_URL%/}/$day/card.json"
+  request_timeout=$(remaining_timeout "$FETCH_TIMEOUT") || return 13
   if code=$(curl --silent --show-error --location --head --output /dev/null \
-    --write-out '%{http_code}' --connect-timeout 3 --max-time "$FETCH_TIMEOUT" \
+    --write-out '%{http_code}' --connect-timeout 3 --max-time "$request_timeout" \
     "$url" 2> "$errors"); then
     rc=0
   else
@@ -389,15 +405,20 @@ fetch_card() {
     404) return 11 ;;
     *) return 12 ;;
   esac
+  request_timeout=$(remaining_timeout "$FETCH_TIMEOUT") || return 13
   if code=$(curl --silent --show-error --location --output "$destination" \
-    --write-out '%{http_code}' --connect-timeout 3 --max-time "$FETCH_TIMEOUT" \
+    --write-out '%{http_code}' --connect-timeout 3 --max-time "$request_timeout" \
     "$url" 2> "$errors"); then
     rc=0
   else
     rc=$?
   fi
   [ "$rc" -eq 0 ] || return 10
-  [ "$code" = 200 ] || return 12
+  case "$code" in
+    200) ;;
+    404) return 11 ;;
+    *) return 12 ;;
+  esac
 }
 
 validate_card() {
@@ -443,7 +464,9 @@ validate_card() {
     (if .status == "empty" then
       ([.projects[].work_items[]] | length) == 0 and
       (.captain_needed | length) == 0
-    else true end)
+    else
+      (([.projects[].work_items[]] | length) + (.captain_needed | length)) > 0
+    end)
   ' "$card" >/dev/null 2>&1
 }
 
@@ -457,16 +480,16 @@ emit_failures() {
   while IFS="$(printf '\t')" read -r day detail; do
     printf -- '- %s: %s\n' "$(friendly_date "$day")" "$detail"
   done < <(jq -rs 'sort_by(.date)[] | [.date,.detail] | @tsv' "$FAILURES")
-  printf '\nThis is missing input, not a quiet day. Firstmate will try again at the next session.\n'
+  printf '\nThis is missing input, not a quiet day.\n'
 }
 
 emit_work() {
   local read_only=$1 suffix
   [ -s "$SURVIVORS" ] || return 0
   if [ "$read_only" -eq 1 ]; then
-    suffix='Every item above was rechecked against GitHub current state. This session cannot act on the review, so it will appear again.'
+    suffix='Every item above remains current and needs review.'
   else
-    suffix='Every item above was rechecked against GitHub current state. Resolve each through the normal project workflow before marking this review complete.'
+    suffix='Every item above remains current and needs resolution.'
   fi
   jq -rs --arg suffix "$suffix" '
     def clean: tostring | gsub("[\u0000-\u001f\u007f]+"; " ") | gsub("\u2063"; "") | gsub("  +"; " ");
@@ -505,15 +528,17 @@ collect() {
   fi
   for tool in curl jq node gh-axi; do
     if ! command -v "$tool" >/dev/null 2>&1; then
-      append_failure "$EPOCH" "the required $tool tool is unavailable, so the retained work could not be checked"
+      append_failure "$EPOCH" 'a required local dependency is unavailable, so the retained work could not be checked'
       emit_failures
       return 0
     fi
   done
   valid_positive_integer "$FETCH_TIMEOUT" || die 'FM_GITHUB_FEEDBACK_FETCH_TIMEOUT must be a positive integer'
   valid_positive_integer "$GH_TIMEOUT" || die 'FM_GITHUB_FEEDBACK_GH_TIMEOUT must be a positive integer'
+  valid_positive_integer "$TOTAL_TIMEOUT" || die 'FM_GITHUB_FEEDBACK_TOTAL_TIMEOUT must be a positive integer'
   valid_date "$EPOCH" || die 'FM_GITHUB_FEEDBACK_EPOCH must be YYYY-MM-DD'
   valid_date "$TODAY" || die 'FM_GITHUB_FEEDBACK_TODAY must be YYYY-MM-DD'
+  DEADLINE=$(($(date +%s) + TOTAL_TIMEOUT))
 
   while IFS= read -r day; do
     [ -n "$day" ] || continue
@@ -534,6 +559,10 @@ collect() {
       11)
         append_failure "$day" 'no completed overnight work was available for this date'
         continue
+        ;;
+      13)
+        append_failure "$day" 'the retained overnight input could not be fully fetched within the available time'
+        break
         ;;
       *)
         append_failure "$day" 'the retained overnight work returned an unexpected response'
