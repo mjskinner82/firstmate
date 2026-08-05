@@ -403,14 +403,45 @@ fetch_card() {
 validate_card() {
   local card=$1 day=$2
   jq -e --arg day "$day" '
+    def nonempty_string: type == "string" and length > 0;
+    def safe_visible_text:
+      nonempty_string and
+      (test("https?://|github\\.com|(^|[^[:alnum:]_])#[0-9]+|\\b(PR|pull request|issue)[[:space:]]*#?[0-9]+\\b|\\b(PRRC_|PRC_|IRC_|IC_|CR_|CHECK_)[[:alnum:]_-]*|\\b(Firstmate|secondmate|crewmate|Ringer|no-mistakes|fm-[[:alnum:]_-]+)\\b|`"; "i") | not);
+    def reference:
+      type == "object" and
+      (.label | nonempty_string) and
+      (.url | nonempty_string and test("^https://github\\.com/[^/]+/[^/]+/(pull|issues)/[0-9]+([/#?].*)?$"));
+    def evidence_ids:
+      type == "array" and length > 0 and all(.[]; nonempty_string);
+    def item:
+      type == "object" and
+      (.headline | safe_visible_text) and
+      (.action | safe_visible_text) and
+      (.consequence | safe_visible_text) and
+      (.priority == "high" or .priority == "medium" or .priority == "low") and
+      .status == "live" and
+      (.status_reason == null or (.status_reason | nonempty_string)) and
+      (.references | type == "array" and length > 0 and all(.[]; reference)) and
+      (.evidence_event_ids | evidence_ids);
+    def project:
+      type == "object" and
+      (.repository | nonempty_string and test("^[^/[:space:]]+/[^/[:space:]]+$")) and
+      (.project_name | safe_visible_text) and
+      (.work_items | type == "array" and all(.[]; item));
+    def decision:
+      type == "object" and
+      (.decision | safe_visible_text) and
+      (.why_only_captain | safe_visible_text) and
+      (.references | type == "array" and length > 0 and all(.[]; reference)) and
+      (.evidence_event_ids | evidence_ids);
     type == "object" and
     .schema_version == "github-feedback-card.v1" and
     .card_date == $day and
     (.status == "ready" or .status == "empty") and
-    (.projects | type == "array") and
-    (.captain_needed | type == "array") and
+    (.projects | type == "array" and all(.[]; project)) and
+    (.captain_needed | type == "array" and all(.[]; decision)) and
     (if .status == "empty" then
-      ([.projects[]?.work_items[]? | select(.status == "live")] | length) == 0 and
+      ([.projects[].work_items[]] | length) == 0 and
       (.captain_needed | length) == 0
     else true end)
   ' "$card" >/dev/null 2>&1
@@ -498,7 +529,7 @@ collect() {
       0) ;;
       10)
         append_failure "$day" 'the retained overnight work could not be reached from this laptop'
-        break
+        continue
         ;;
       11)
         append_failure "$day" 'no completed overnight work was available for this date'

@@ -3,6 +3,8 @@
 #
 # Coverage:
 #   - a transport failure is visible and cannot be mistaken for a quiet day
+#   - transport failure on one date does not suppress later retained dates
+#   - malformed or unsafe cards are rejected without advancing review state
 #   - every unreviewed date is fetched and surfaced together
 #   - current resolved-thread state drops stale card work silently
 #   - acknowledgment records exactly the dates from actionable output
@@ -166,6 +168,65 @@ EOF
   pass 'fetch failure is visibly distinct from a quiet day'
 }
 
+test_transport_failure_does_not_stop_catchup() {
+  local record dir fakebin out
+  record=$(make_world transport-catchup)
+  IFS='|' read -r dir fakebin <<EOF
+$record
+EOF
+  write_ready_card "$dir/cards/2026-08-05.json" 2026-08-05 'Later Project' 'owner/later' \
+    'Repair the later release check' 'Correct the later release validation.' 'The later release cannot land safely.' \
+    'https://github.com/owner/later/pull/44' 'PRC_later'
+  write_pr_state "$dir/gh/owner--later--44.out" $'PR\tOPEN\tfalse\tfalse\tfalse'
+
+  out=$(FM_TEST_FETCH_FAIL_DATE=2026-08-04 run_intake "$dir" "$fakebin" 2026-08-06)
+  assert_contains "$out" 'OVERNIGHT GITHUB WORK UNAVAILABLE' 'failed date was not reported'
+  assert_contains "$out" 'Later Project' 'later retained date was suppressed by an earlier transport failure'
+  assert_contains "$(cat "$dir/curl.log")" '2026-08-05' 'later retained date was not fetched'
+  assert_contains "$(cat "$dir/home/state/github-feedback-pending-dates")" '2026-08-05' 'later actionable date was not pending'
+  pass 'transport failure does not suppress later retained dates'
+}
+
+test_invalid_card_is_not_reviewed() {
+  local record dir fakebin out
+  record=$(make_world invalid-card)
+  IFS='|' read -r dir fakebin <<EOF
+$record
+EOF
+  jq -n '{
+    schema_version:"github-feedback-card.v1",
+    card_date:"2026-08-04",
+    status:"ready",
+    projects:[{}],
+    captain_needed:[]
+  }' > "$dir/cards/2026-08-04.json"
+
+  out=$(run_intake "$dir" "$fakebin" 2026-08-05)
+  assert_contains "$out" 'did not match the required complete-card contract' 'malformed nested card was not reported as invalid'
+  assert_absent "$dir/home/state/github-feedback-reviewed-dates" 'malformed card advanced the review record'
+  assert_absent "$dir/home/state/github-feedback-pending-dates" 'malformed card became actionable'
+  pass 'malformed nested card is rejected without review acknowledgment'
+}
+
+test_unsafe_prose_is_rejected_without_echo() {
+  local record dir fakebin out unsafe
+  record=$(make_world unsafe-prose)
+  IFS='|' read -r dir fakebin <<EOF
+$record
+EOF
+  unsafe='Run fm-spawn for PR #71 at https://github.com/owner/unsafe/pull/71'
+  write_ready_card "$dir/cards/2026-08-04.json" 2026-08-04 'Unsafe Project' 'owner/unsafe' \
+    "$unsafe" 'Apply the requested correction.' 'The release cannot land safely.' \
+    'https://github.com/owner/unsafe/pull/71' 'PRC_unsafe'
+
+  out=$(run_intake "$dir" "$fakebin" 2026-08-05)
+  assert_contains "$out" 'did not match the required complete-card contract' 'unsafe visible prose was not rejected'
+  assert_not_contains "$out" "$unsafe" 'unsafe visible prose was echoed'
+  assert_not_contains "$out" 'PR #71' 'a GitHub identifier leaked from rejected prose'
+  assert_absent "$dir/home/state/github-feedback-reviewed-dates" 'unsafe card advanced the review record'
+  pass 'unsafe prose is rejected without leaking identifiers or mechanics'
+}
+
 test_multiple_unreviewed_days_surface_and_acknowledge() {
   local record dir fakebin out second
   record=$(make_world multi-day)
@@ -217,6 +278,9 @@ EOF
 }
 
 test_fetch_failure_is_not_quiet
+test_transport_failure_does_not_stop_catchup
+test_invalid_card_is_not_reviewed
+test_unsafe_prose_is_rejected_without_echo
 test_multiple_unreviewed_days_surface_and_acknowledge
 test_resolved_thread_is_dropped_silently
 
