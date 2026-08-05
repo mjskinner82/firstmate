@@ -90,7 +90,7 @@ date_range() {
   node -e '
     const start = new Date(`${process.argv[1]}T00:00:00Z`);
     const end = new Date(`${process.argv[2]}T00:00:00Z`);
-    for (let at = start.getTime(); at < end.getTime(); at += 86400000) {
+    for (let at = start.getTime(); at <= end.getTime(); at += 86400000) {
       process.stdout.write(`${new Date(at).toISOString().slice(0, 10)}\n`);
     }
   ' "$1" "$2"
@@ -424,10 +424,18 @@ fetch_card() {
 validate_card() {
   local card=$1 day=$2
   jq -e --arg day "$day" '
-    def nonempty_string: type == "string" and length > 0;
+    def normalized_text:
+      tostring |
+      gsub("[\u0000-\u001f\u007f]+"; " ") |
+      gsub("\u2063"; "") |
+      gsub("  +"; " ") |
+      gsub("^ +| +$"; "");
+    def nonempty_string: type == "string" and (normalized_text | length > 0);
     def safe_visible_text:
-      nonempty_string and
-      (test("https?://|github\\.com|(^|[^[:alnum:]_])#[0-9]+|\\b(PR|pull request|issue)[[:space:]]*#?[0-9]+\\b|\\b(PRRC_|PRC_|IRC_|IC_|CR_|CHECK_)[[:alnum:]_-]*|\\b(Firstmate|secondmate|crewmate|Ringer|no-mistakes|fm-[[:alnum:]_-]+)\\b|`"; "i") | not);
+      type == "string" and
+      (normalized_text as $text |
+        ($text | length > 0) and
+        ($text | test("https?://|github\\.com|(^|[^[:alnum:]_])#[0-9]+|\\b(PR|pull request|issue)[[:space:]]*#?[0-9]+\\b|\\b(PRRC_|PRC_|IRC_|IC_|CR_|CHECK_)[[:alnum:]_-]*|\\b(Firstmate|secondmate|crewmate|Ringer|no-mistakes|fm-[[:alnum:]_-]+)\\b|`"; "i") | not));
     def reference:
       type == "object" and
       (.label | nonempty_string) and
@@ -492,7 +500,7 @@ emit_work() {
     suffix='Every item above remains current and needs resolution.'
   fi
   jq -rs --arg suffix "$suffix" '
-    def clean: tostring | gsub("[\u0000-\u001f\u007f]+"; " ") | gsub("\u2063"; "") | gsub("  +"; " ");
+    def clean: tostring | gsub("[\u0000-\u001f\u007f]+"; " ") | gsub("\u2063"; "") | gsub("  +"; " ") | gsub("^ +| +$"; "");
     def rank: if .priority == "high" then 0 elif .priority == "medium" then 1 else 2 end;
     unique_by([.kind,.project,.headline,.action,.consequence]) as $all |
     [$all[] | select(.kind == "job")] as $jobs |

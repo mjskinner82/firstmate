@@ -7,6 +7,7 @@
 #   - route-wide failure is bounded by the aggregate intake deadline
 #   - GET-side 404 remains distinct from an unexpected response
 #   - malformed or unsafe cards are rejected without advancing review state
+#   - current-date cards are included and normalized-empty prose is rejected
 #   - every unreviewed date is fetched and surfaced together
 #   - current resolved-thread state drops stale card work silently
 #   - acknowledgment records exactly the dates from actionable output
@@ -174,7 +175,7 @@ test_fetch_failure_is_not_quiet() {
   IFS='|' read -r dir fakebin <<EOF
 $record
 EOF
-  if out=$(FM_TEST_FETCH_FAIL_DATE=2026-08-04 run_intake "$dir" "$fakebin" 2026-08-05); then
+  if out=$(FM_TEST_FETCH_FAIL_DATE=2026-08-04 run_intake "$dir" "$fakebin" 2026-08-04); then
     :
   else
     fail 'transport failure should be reported without aborting session start'
@@ -197,7 +198,7 @@ EOF
     'https://github.com/owner/later/pull/44' 'PRC_later'
   write_pr_state "$dir/gh/owner--later--44.out" $'PR\tOPEN\tfalse\tfalse\tfalse'
 
-  out=$(FM_TEST_FETCH_FAIL_DATE=2026-08-04 run_intake "$dir" "$fakebin" 2026-08-06)
+  out=$(FM_TEST_FETCH_FAIL_DATE=2026-08-04 run_intake "$dir" "$fakebin" 2026-08-05)
   assert_contains "$out" 'OVERNIGHT GITHUB WORK UNAVAILABLE' 'failed date was not reported'
   assert_contains "$out" 'Later Project' 'later retained date was suppressed by an earlier transport failure'
   assert_contains "$(cat "$dir/curl.log")" '2026-08-05' 'later retained date was not fetched'
@@ -227,7 +228,7 @@ test_get_404_is_reported_distinctly() {
 $record
 EOF
 
-  out=$(FM_TEST_GET_404_DATE=2026-08-04 run_intake "$dir" "$fakebin" 2026-08-05)
+  out=$(FM_TEST_GET_404_DATE=2026-08-04 run_intake "$dir" "$fakebin" 2026-08-04)
   assert_contains "$out" 'no completed overnight work was available for this date' 'GET-side 404 was not reported as missing input'
   assert_not_contains "$out" 'unexpected response' 'GET-side 404 was misclassified as unexpected'
   assert_absent "$dir/home/state/github-feedback-reviewed-dates" 'GET-side 404 advanced the review record'
@@ -248,7 +249,7 @@ EOF
     captain_needed:[]
   }' > "$dir/cards/2026-08-04.json"
 
-  out=$(run_intake "$dir" "$fakebin" 2026-08-05)
+  out=$(run_intake "$dir" "$fakebin" 2026-08-04)
   assert_contains "$out" 'did not match the required complete-card contract' 'malformed nested card was not reported as invalid'
   assert_absent "$dir/home/state/github-feedback-reviewed-dates" 'malformed card advanced the review record'
   assert_absent "$dir/home/state/github-feedback-pending-dates" 'malformed card became actionable'
@@ -269,7 +270,7 @@ EOF
     captain_needed:[]
   }' > "$dir/cards/2026-08-04.json"
 
-  out=$(run_intake "$dir" "$fakebin" 2026-08-05)
+  out=$(run_intake "$dir" "$fakebin" 2026-08-04)
   assert_contains "$out" 'did not match the required complete-card contract' 'empty ready card was not reported as invalid'
   assert_absent "$dir/home/state/github-feedback-reviewed-dates" 'empty ready card advanced the review record'
   pass 'empty ready card is rejected without review acknowledgment'
@@ -286,12 +287,47 @@ EOF
     "$unsafe" 'Apply the requested correction.' 'The release cannot land safely.' \
     'https://github.com/owner/unsafe/pull/71' 'PRC_unsafe'
 
-  out=$(run_intake "$dir" "$fakebin" 2026-08-05)
+  out=$(run_intake "$dir" "$fakebin" 2026-08-04)
   assert_contains "$out" 'did not match the required complete-card contract' 'unsafe visible prose was not rejected'
   assert_not_contains "$out" "$unsafe" 'unsafe visible prose was echoed'
   assert_not_contains "$out" 'PR #71' 'a GitHub identifier leaked from rejected prose'
   assert_absent "$dir/home/state/github-feedback-reviewed-dates" 'unsafe card advanced the review record'
   pass 'unsafe prose is rejected without leaking identifiers or mechanics'
+}
+
+test_current_date_card_is_included() {
+  local record dir fakebin out
+  record=$(make_world current-date)
+  IFS='|' read -r dir fakebin <<EOF
+$record
+EOF
+  write_ready_card "$dir/cards/2026-08-04.json" 2026-08-04 'Current Project' 'owner/current' \
+    'Repair the current release check' 'Correct the current release validation.' 'The current release cannot land safely.' \
+    'https://github.com/owner/current/pull/72' 'PRC_current'
+  write_pr_state "$dir/gh/owner--current--72.out" $'PR\tOPEN\tfalse\tfalse\tfalse'
+
+  out=$(run_intake "$dir" "$fakebin" 2026-08-04)
+  assert_contains "$out" 'Current Project' 'current-date project was not surfaced'
+  assert_contains "$(cat "$dir/home/state/github-feedback-pending-dates")" '2026-08-04' 'current date was not pending'
+  pass 'current-date retained card is included'
+}
+
+test_normalized_empty_prose_is_rejected() {
+  local record dir fakebin out invisible
+  record=$(make_world normalized-empty)
+  IFS='|' read -r dir fakebin <<EOF
+$record
+EOF
+  invisible=$' \t\u2063\n '
+  write_ready_card "$dir/cards/2026-08-04.json" 2026-08-04 'Invisible Project' 'owner/invisible' \
+    "$invisible" 'Apply the requested correction.' 'The release cannot land safely.' \
+    'https://github.com/owner/invisible/pull/73' 'PRC_invisible'
+
+  out=$(run_intake "$dir" "$fakebin" 2026-08-04)
+  assert_contains "$out" 'did not match the required complete-card contract' 'normalized-empty prose was not rejected'
+  assert_not_contains "$out" 'OVERNIGHT GITHUB WORK'$'\n\n' 'normalized-empty prose produced a work section'
+  assert_absent "$dir/home/state/github-feedback-reviewed-dates" 'normalized-empty card advanced the review record'
+  pass 'normalized-empty visible prose is rejected'
 }
 
 test_multiple_unreviewed_days_surface_and_acknowledge() {
@@ -309,7 +345,7 @@ EOF
   write_pr_state "$dir/gh/owner--alpha--11.out" $'PR\tOPEN\tfalse\tfalse\tfalse'
   write_pr_state "$dir/gh/owner--beta--22.out" $'PR\tOPEN\tfalse\tfalse\tfalse'
 
-  out=$(run_intake "$dir" "$fakebin" 2026-08-06)
+  out=$(run_intake "$dir" "$fakebin" 2026-08-05)
   assert_contains "$out" 'Alpha Project' 'oldest unread project was not surfaced'
   assert_contains "$out" 'Repair the release check' 'oldest unread job was not surfaced'
   assert_contains "$out" 'Beta Project' 'newer unread project was not surfaced'
@@ -319,10 +355,10 @@ EOF
   assert_contains "$(cat "$dir/home/state/github-feedback-pending-dates")" '2026-08-04' 'oldest actionable date was not pending'
   assert_contains "$(cat "$dir/home/state/github-feedback-pending-dates")" '2026-08-05' 'newer actionable date was not pending'
 
-  run_intake "$dir" "$fakebin" 2026-08-06 acknowledge >/dev/null
+  run_intake "$dir" "$fakebin" 2026-08-05 acknowledge >/dev/null
   assert_contains "$(cat "$dir/home/state/github-feedback-reviewed-dates")" '2026-08-04' 'acknowledgment omitted the oldest date'
   assert_contains "$(cat "$dir/home/state/github-feedback-reviewed-dates")" '2026-08-05' 'acknowledgment omitted the newer date'
-  second=$(run_intake "$dir" "$fakebin" 2026-08-06)
+  second=$(run_intake "$dir" "$fakebin" 2026-08-05)
   [ -z "$second" ] || fail "acknowledged dates surfaced again: $second"
   pass 'multiple unread days are grouped into one dispatchable review and acknowledged exactly'
 }
@@ -338,7 +374,7 @@ EOF
     'https://github.com/owner/gamma/pull/33' 'PRRC_stale'
   write_pr_state "$dir/gh/owner--gamma--33.out" $'PR\tOPEN\tfalse\tfalse\tfalse\nCOMMENT\tPRRC_stale\ttrue\tfalse\tfalse\tfalse'
 
-  out=$(run_intake "$dir" "$fakebin" 2026-08-05)
+  out=$(run_intake "$dir" "$fakebin" 2026-08-04)
   [ -z "$out" ] || fail "resolved review thread reached the output: $out"
   assert_contains "$(cat "$dir/home/state/github-feedback-reviewed-dates")" '2026-08-04' 'fully stale date was not recorded silently'
   assert_absent "$dir/home/state/github-feedback-pending-dates" 'fully stale date remained pending'
@@ -352,6 +388,8 @@ test_get_404_is_reported_distinctly
 test_invalid_card_is_not_reviewed
 test_empty_ready_card_is_not_reviewed
 test_unsafe_prose_is_rejected_without_echo
+test_current_date_card_is_included
+test_normalized_empty_prose_is_rejected
 test_multiple_unreviewed_days_surface_and_acknowledge
 test_resolved_thread_is_dropped_silently
 
