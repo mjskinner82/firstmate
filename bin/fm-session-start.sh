@@ -47,7 +47,8 @@
 #                       state/.afk, and a cheap per-task endpoint-liveness read:
 #                       read-only, always runs.
 #   7. network checks - the result of the deferred network stage started back at
-#                       step 1, harvested WITHOUT waiting for it.
+#                       step 1, including main-home retained GitHub feedback,
+#                       harvested WITHOUT waiting for it.
 #   8. context digest - data/projects.md, data/secondmates.md, data/captain.md,
 #                       data/captain-shared.md, data/learnings.md: read-only,
 #                       always safe, always runs.
@@ -65,8 +66,9 @@
 # entire FM_SESSION_START_TIMEOUT and truncate the digest, so a slow network
 # could cost the work queue itself.
 # So no step between here and the last line below makes an external-network
-# call. The five that did - `gh auth status`, secondmate liveness, secondmate
-# convergence, pending remote handoff delivery, and the fleet-sync fetch - are
+# call. The checks that do - `gh auth status`, retained GitHub feedback intake,
+# secondmate liveness, secondmate convergence, pending remote handoff delivery,
+# and the fleet-sync fetch - are
 # started as one detached bounded worker right after the lock (step 1) and
 # harvested at step 7 without ever blocking on it. bin/fm-startup-network.sh
 # owns that stage and its safety argument; bin/fm-bootstrap.sh remains the owner
@@ -753,7 +755,7 @@ fi
 stage network-checks
 section "NETWORK CHECKS"
 if [ "$READ_ONLY" -eq 1 ]; then
-  printf 'skipped (read-only session) - GitHub authentication, project clone refresh,\n'
+  printf 'skipped (read-only session) - GitHub authentication, retained GitHub feedback, project clone refresh,\n'
   printf 'secondmate liveness and convergence, and pending handoff delivery were not run.\n'
   printf 'They need the fleet lock, and this session must not spawn, steer, or merge, so it\n'
   printf 'has no action they would gate. The session holding the lock runs them.\n'
