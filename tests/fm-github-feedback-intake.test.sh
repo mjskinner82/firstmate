@@ -124,6 +124,7 @@ write_ready_card() {
         schema_version:"github-feedback-card.v1",
         card_date:$date,
         status:"ready",
+        check_states:[],
         projects:[{
           repository:$repository,
           project_name:$project,
@@ -415,6 +416,96 @@ EOF
   pass 'a live card item resolved after generation is dropped silently'
 }
 
+test_unresolved_outdated_thread_remains_live() {
+  local record dir fakebin out
+  record=$(make_world unresolved-outdated-thread)
+  IFS='|' read -r dir fakebin <<EOF
+$record
+EOF
+  write_ready_card "$dir/cards/2026-08-04.json" 2026-08-04 'Outdated Context Project' 'owner/outdated' \
+    'Apply the unresolved review request' 'Correct the requested behavior.' 'The reviewer request remains unresolved.' \
+    'https://github.com/owner/outdated/pull/34' 'PRRC_unresolved'
+  write_pr_state "$dir/gh/owner--outdated--34.out" $'PR\tOPEN\tfalse\tfalse\tfalse\nCOMMENT\tPRRC_unresolved\tfalse\ttrue\tfalse\tfalse'
+
+  out=$(run_intake "$dir" "$fakebin" 2026-08-04)
+  assert_contains "$out" 'Apply the unresolved review request' 'unresolved outdated review thread was omitted'
+  assert_contains "$(cat "$dir/home/state/github-feedback-pending-dates")" '2026-08-04' 'unresolved outdated thread date was not pending'
+  assert_absent "$dir/home/state/github-feedback-reviewed-dates" 'unresolved outdated thread was marked reviewed'
+  pass 'an unresolved review thread remains live after its diff context becomes outdated'
+}
+
+test_replacement_check_uses_stable_identity() {
+  local record dir fakebin out updated
+  record=$(make_world replacement-check)
+  IFS='|' read -r dir fakebin <<EOF
+$record
+EOF
+  write_ready_card "$dir/cards/2026-08-04.json" 2026-08-04 'Replacement Check Project' 'owner/checks' \
+    'Repair the failing test check' 'Correct the test failure.' 'The change cannot land safely.' \
+    'https://github.com/owner/checks/pull/35' 'CR_old'
+  updated="$dir/cards/2026-08-04.updated.json"
+  jq '.check_states = [{github_object_id:"CR_old",repository:"owner/checks",name:"Tests",status:"completed",conclusion:"failure"}]' \
+    "$dir/cards/2026-08-04.json" > "$updated"
+  mv "$updated" "$dir/cards/2026-08-04.json"
+  write_pr_state "$dir/gh/owner--checks--35.out" $'PR\tOPEN\tfalse\tfalse\tfalse\nCHECK\tCR_new\tTests\tCOMPLETED\tFAILURE'
+
+  out=$(run_intake "$dir" "$fakebin" 2026-08-04)
+  assert_contains "$out" 'Repair the failing test check' 'failing replacement check was omitted'
+  assert_contains "$(cat "$dir/home/state/github-feedback-pending-dates")" '2026-08-04' 'replacement check date was not pending'
+  assert_absent "$dir/home/state/github-feedback-reviewed-dates" 'replacement check was marked reviewed'
+  pass 'a replacement check run is matched by stable check identity'
+}
+
+test_unmatched_check_without_identity_is_uncertain() {
+  local record dir fakebin out
+  record=$(make_world unmatched-check)
+  IFS='|' read -r dir fakebin <<EOF
+$record
+EOF
+  write_ready_card "$dir/cards/2026-08-04.json" 2026-08-04 'Uncertain Check Project' 'owner/uncertain' \
+    'Repair the uncertain check' 'Correct the check failure.' 'The current result cannot be verified.' \
+    'https://github.com/owner/uncertain/pull/36' 'CR_old'
+  write_pr_state "$dir/gh/owner--uncertain--36.out" $'PR\tOPEN\tfalse\tfalse\tfalse\nCHECK\tCR_new\tTests\tCOMPLETED\tFAILURE'
+
+  out=$(run_intake "$dir" "$fakebin" 2026-08-04)
+  assert_contains "$out" 'OVERNIGHT GITHUB WORK UNAVAILABLE' 'unmatched check without stable identity was not reported as uncertain'
+  assert_contains "$out" 'current GitHub state could not be checked' 'unmatched check uncertainty lacked current-state detail'
+  assert_absent "$dir/home/state/github-feedback-reviewed-dates" 'uncertain unmatched check was marked reviewed'
+  assert_absent "$dir/home/state/github-feedback-pending-dates" 'uncertain unmatched check became actionable'
+  pass 'an unmatched check without stable identity fails closed'
+}
+
+test_dependency_failure_reports_only_unreviewed_dates() {
+  local record dir fakebin out
+  record=$(make_world dependency-pending-dates)
+  IFS='|' read -r dir fakebin <<EOF
+$record
+EOF
+  printf '%s\n' '2026-08-04' > "$dir/home/state/github-feedback-reviewed-dates"
+  rm "$fakebin/gh-axi"
+
+  out=$(PATH=/usr/bin:/bin run_intake "$dir" "$fakebin" 2026-08-06)
+  assert_not_contains "$out" 'August 4, 2026' 'dependency failure named an already reviewed date'
+  assert_contains "$out" 'August 5, 2026' 'dependency failure omitted the first pending date'
+  assert_contains "$out" 'August 6, 2026' 'dependency failure omitted the second pending date'
+  assert_absent "$dir/home/state/github-feedback-pending-dates" 'dependency failure created actionable state'
+  pass 'dependency failures report every genuinely pending date'
+}
+
+test_dependency_failure_is_silent_when_all_dates_are_reviewed() {
+  local record dir fakebin out
+  record=$(make_world dependency-no-pending-dates)
+  IFS='|' read -r dir fakebin <<EOF
+$record
+EOF
+  printf '%s\n' '2026-08-04' '2026-08-05' > "$dir/home/state/github-feedback-reviewed-dates"
+  rm "$fakebin/gh-axi"
+
+  out=$(PATH=/usr/bin:/bin run_intake "$dir" "$fakebin" 2026-08-05)
+  [ -z "$out" ] || fail "dependency failure surfaced with no unreviewed dates: $out"
+  pass 'missing dependencies stay silent when no dates remain'
+}
+
 test_fetch_failure_is_not_quiet
 test_transport_failure_does_not_stop_catchup
 test_route_failure_respects_total_timeout
@@ -427,5 +518,10 @@ test_normalized_empty_prose_is_rejected
 test_multiple_unreviewed_days_surface_and_acknowledge
 test_deduplication_uses_evidence_identity
 test_resolved_thread_is_dropped_silently
+test_unresolved_outdated_thread_remains_live
+test_replacement_check_uses_stable_identity
+test_unmatched_check_without_identity_is_uncertain
+test_dependency_failure_reports_only_unreviewed_dates
+test_dependency_failure_is_silent_when_all_dates_are_reviewed
 
 echo '# fm-github-feedback-intake.test.sh: all assertions passed'

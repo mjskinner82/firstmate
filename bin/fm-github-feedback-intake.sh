@@ -75,25 +75,67 @@ valid_positive_integer() {
 }
 
 valid_date() {
+  local year month day maximum
   case "$1" in
     [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
     *) return 1 ;;
   esac
-  node -e '
-    const value = process.argv[1];
-    const parsed = new Date(`${value}T00:00:00Z`);
-    if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) process.exit(1);
-  ' "$1" >/dev/null 2>&1
+  IFS=- read -r year month day <<EOF
+$1
+EOF
+  year=$((10#$year))
+  month=$((10#$month))
+  day=$((10#$day))
+  [ "$month" -ge 1 ] && [ "$month" -le 12 ] || return 1
+  maximum=$(days_in_month "$year" "$month")
+  [ "$day" -ge 1 ] && [ "$day" -le "$maximum" ]
+}
+
+days_in_month() {
+  local year=$1 month=$2
+  case "$month" in
+    1|3|5|7|8|10|12) printf '31\n' ;;
+    4|6|9|11) printf '30\n' ;;
+    2)
+      if [ $((year % 400)) -eq 0 ] || { [ $((year % 4)) -eq 0 ] && [ $((year % 100)) -ne 0 ]; }; then
+        printf '29\n'
+      else
+        printf '28\n'
+      fi
+      ;;
+  esac
+}
+
+next_date() {
+  local value=$1 year month day maximum
+  IFS=- read -r year month day <<EOF
+$value
+EOF
+  year=$((10#$year))
+  month=$((10#$month))
+  day=$((10#$day))
+  maximum=$(days_in_month "$year" "$month")
+  if [ "$day" -lt "$maximum" ]; then
+    day=$((day + 1))
+  elif [ "$month" -lt 12 ]; then
+    month=$((month + 1))
+    day=1
+  else
+    year=$((year + 1))
+    month=1
+    day=1
+  fi
+  printf '%04d-%02d-%02d\n' "$year" "$month" "$day"
 }
 
 date_range() {
-  node -e '
-    const start = new Date(`${process.argv[1]}T00:00:00Z`);
-    const end = new Date(`${process.argv[2]}T00:00:00Z`);
-    for (let at = start.getTime(); at <= end.getTime(); at += 86400000) {
-      process.stdout.write(`${new Date(at).toISOString().slice(0, 10)}\n`);
-    }
-  ' "$1" "$2"
+  local current=$1 end=$2
+  [[ "$current" > "$end" ]] && return 0
+  while :; do
+    printf '%s\n' "$current"
+    [ "$current" = "$end" ] && return 0
+    current=$(next_date "$current")
+  done
 }
 
 friendly_date() {
@@ -214,7 +256,7 @@ query_pull_request() {
   local owner=$1 repo=$2 number=$3 cache=$4 output rc query filter request_timeout
   [ -f "$cache" ] && return 0
   [ ! -e "$TMP/github-unavailable" ] || return 1
-  query='query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){state merged reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved isOutdated comments(first:100){pageInfo{hasNextPage} nodes{id isMinimized}}}} commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{__typename ... on CheckRun{id status conclusion}}}}}}}}}}'
+  query='query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){state merged reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved isOutdated comments(first:100){pageInfo{hasNextPage} nodes{id isMinimized}}}} commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{__typename ... on CheckRun{id name status conclusion}}}}}}}}}}'
   filter='.data.repository.pullRequest as $p |
     if $p == null then "MISSING"
     else
@@ -224,7 +266,7 @@ query_pull_request() {
       ($p.reviewThreads.nodes[]? | . as $thread | .comments.nodes[]? |
         ["COMMENT",.id,($thread.isResolved|tostring),($thread.isOutdated|tostring),(.isMinimized|tostring),($thread.comments.pageInfo.hasNextPage|tostring)]|@tsv),
       ($p.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]? |
-        select(.__typename == "CheckRun") | ["CHECK",.id,.status,(.conclusion // "")]|@tsv)
+        select(.__typename == "CheckRun") | ["CHECK",.id,.name,.status,(.conclusion // "")]|@tsv)
     end'
   output="$TMP/gh-pr-$(cache_key "$owner/$repo/$number").out"
   request_timeout=$(remaining_timeout "$GH_TIMEOUT") || return 1
@@ -278,8 +320,8 @@ reference_parts() {
 }
 
 assess_pull_request() {
-  local owner=$1 repo=$2 number=$3 ids=$4 key cache header kind state merged thread_more check_more
-  local id row resolved outdated minimized status conclusion live=0 uncertain=0 evidence_count=0
+  local owner=$1 repo=$2 number=$3 ids=$4 card=$5 key cache header kind state merged thread_more check_more
+  local id row resolved status conclusion stable_name live=0 uncertain=0 evidence_count=0
   key=$(cache_key "pull/$owner/$repo/$number")
   cache="$TMP/cache-$key"
   query_pull_request "$owner" "$repo" "$number" "$cache" || { printf 'error\n'; return; }
@@ -298,27 +340,41 @@ EOF
       PRRC_*)
         row=$(awk -F '\t' -v want="$id" '$1 == "COMMENT" && $2 == want { print; exit }' "$cache")
         if [ -n "$row" ]; then
-          IFS="$(printf '\t')" read -r _ _ resolved outdated minimized _comment_more <<EOF
+          IFS="$(printf '\t')" read -r _ _ resolved _outdated _minimized _comment_more <<EOF
 $row
 EOF
-          if [ "$resolved" = false ] && [ "$outdated" = false ] && [ "$minimized" = false ]; then
+          if [ "$resolved" = false ]; then
             live=1
+          elif [ "$resolved" != true ]; then
+            uncertain=1
           fi
-        elif [ "$thread_more" = true ]; then
+        else
           uncertain=1
         fi
         ;;
       CR_*|CHECK_*)
         row=$(awk -F '\t' -v want="$id" '$1 == "CHECK" && $2 == want { print; exit }' "$cache")
+        if [ -z "$row" ]; then
+          stable_name=$(jq -r --arg id "$id" --arg repository "$owner/$repo" '
+            [.check_states[]? |
+              select(.github_object_id == $id and .repository == $repository and (.name | type == "string") and (.name | length > 0)) |
+              .name] |
+            unique |
+            if length == 1 then @tsv else empty end
+          ' "$card")
+          if [ -n "$stable_name" ]; then
+            row=$(awk -F '\t' -v want="$stable_name" '$1 == "CHECK" && $3 == want { print; exit }' "$cache")
+          fi
+        fi
         if [ -n "$row" ]; then
-          IFS="$(printf '\t')" read -r _ _ status conclusion <<EOF
+          IFS="$(printf '\t')" read -r _ _ _ status conclusion <<EOF
 $row
 EOF
           case "$status:$conclusion" in
             COMPLETED:SUCCESS|COMPLETED:NEUTRAL|COMPLETED:SKIPPED) ;;
             *) live=1 ;;
           esac
-        elif [ "$check_more" = true ]; then
+        else
           uncertain=1
         fi
         ;;
@@ -354,7 +410,7 @@ EOF
 }
 
 assess_item() {
-  local item=$1 refs ids parts owner repo kind number verdict any=0 uncertain=0
+  local item=$1 card=$2 refs ids parts owner repo kind number verdict any=0 uncertain=0
   refs="$TMP/item-refs"
   ids="$TMP/item-ids"
   printf '%s' "$item" | jq -r '.references[]?.url // empty' > "$refs"
@@ -370,7 +426,7 @@ assess_item() {
 $parts
 EOF
     case "$kind" in
-      pull) verdict=$(assess_pull_request "$owner" "$repo" "$number" "$ids") ;;
+      pull) verdict=$(assess_pull_request "$owner" "$repo" "$number" "$ids" "$card") ;;
       issues) verdict=$(assess_issue "$owner" "$repo" "$number") ;;
       *) verdict=error ;;
     esac
@@ -529,28 +585,41 @@ emit_work() {
 
 collect() {
   local read_only=$1 day card fetch_errors rc status rows row project item verdict
-  local day_survivors day_error day_live
+  local day_survivors day_error day_live unreviewed
 
   if [ "${FM_GITHUB_FEEDBACK_DISABLED:-0}" = 1 ]; then
     return 0
   fi
-  for tool in curl jq node gh-axi; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-      append_failure "$EPOCH" 'a required local dependency is unavailable, so the retained work could not be checked'
-      emit_failures
-      return 0
-    fi
-  done
   valid_positive_integer "$FETCH_TIMEOUT" || die 'FM_GITHUB_FEEDBACK_FETCH_TIMEOUT must be a positive integer'
   valid_positive_integer "$GH_TIMEOUT" || die 'FM_GITHUB_FEEDBACK_GH_TIMEOUT must be a positive integer'
   valid_positive_integer "$TOTAL_TIMEOUT" || die 'FM_GITHUB_FEEDBACK_TOTAL_TIMEOUT must be a positive integer'
   valid_date "$EPOCH" || die 'FM_GITHUB_FEEDBACK_EPOCH must be YYYY-MM-DD'
   valid_date "$TODAY" || die 'FM_GITHUB_FEEDBACK_TODAY must be YYYY-MM-DD'
+
+  unreviewed="$TMP/unreviewed-dates"
+  : > "$unreviewed"
+  while IFS= read -r day; do
+    [ -n "$day" ] || continue
+    reviewed_has "$day" || printf '%s\n' "$day" >> "$unreviewed"
+  done < <(date_range "$EPOCH" "$TODAY")
+  if [ ! -s "$unreviewed" ]; then
+    [ "$read_only" -eq 1 ] || write_pending "$NEW_PENDING" || die 'could not clear the actionable local review record'
+    return 0
+  fi
+
+  for tool in curl jq gh-axi; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      while IFS= read -r day; do
+        append_failure "$day" 'a required local dependency is unavailable, so the retained work could not be checked'
+      done < "$unreviewed"
+      emit_failures
+      return 0
+    fi
+  done
   DEADLINE=$(($(date +%s) + TOTAL_TIMEOUT))
 
   while IFS= read -r day; do
     [ -n "$day" ] || continue
-    reviewed_has "$day" && continue
     card="$TMP/card-$day.json"
     fetch_errors="$TMP/fetch-$day.err"
     if fetch_card "$day" "$card" "$fetch_errors"; then
@@ -602,7 +671,7 @@ collect() {
       [ -n "$row" ] || continue
       project=$(printf '%s' "$row" | jq -r '.project')
       item=$(printf '%s' "$row" | jq -c '.item')
-      verdict=$(assess_item "$item")
+      verdict=$(assess_item "$item" "$card")
       case "$verdict" in
         live)
           day_live=1
@@ -632,7 +701,7 @@ collect() {
     while IFS= read -r row; do
       [ -n "$row" ] || continue
       item=$(printf '%s' "$row" | jq -c '.item')
-      verdict=$(assess_item "$item")
+      verdict=$(assess_item "$item" "$card")
       case "$verdict" in
         live)
           day_live=1
@@ -664,7 +733,7 @@ collect() {
     else
       printf '%s\n' "$day" >> "$AUTO_REVIEWED"
     fi
-  done < <(date_range "$EPOCH" "$TODAY")
+  done < "$unreviewed"
 
   if [ "$read_only" -eq 0 ]; then
     mark_reviewed_from_file "$AUTO_REVIEWED" || append_failure "$EPOCH" 'the completed local review could not be recorded'
