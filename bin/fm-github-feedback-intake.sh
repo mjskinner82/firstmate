@@ -1,0 +1,789 @@
+#!/usr/bin/env bash
+# fm-github-feedback-intake.sh - consume retained daily GitHub feedback cards.
+#
+# The nightly producer owns the card schema and retention contract.
+# This consumer is read-only against both the producer and GitHub:
+#
+#   1. Fetch every unreviewed Pacific date from the private Tailnet endpoint.
+#   2. Validate the complete machine-card contract before trusting a card.
+#   3. Recheck every live candidate against current GitHub state through gh-axi.
+#   4. Drop work whose pull request, issue, review thread, or check is no longer live.
+#   5. Render only surviving jobs, grouped by project and ranked by consequence.
+#
+# A missing or unreachable card is printed as unavailable input and is never
+# recorded as a quiet day. A valid empty card, or a ready card whose work is now
+# entirely stale, is recorded locally and produces no output. A date with live
+# work remains pending until Firstmate has dispatched, deferred, or otherwise
+# resolved every item and runs the acknowledge command.
+#
+# Local state:
+#   state/github-feedback-reviewed-dates  one successfully handled YYYY-MM-DD per line
+#   state/github-feedback-pending-dates   exact dates in the current actionable output
+# The --read-only mode performs the same retrieval and relevance checks without
+# changing either local record.
+#
+# Usage:
+#   fm-github-feedback-intake.sh [--read-only]
+#   fm-github-feedback-intake.sh acknowledge
+#
+# The default route and first possible card date are the handoff contract that
+# shipped with the producer. Environment overrides exist for isolated tests:
+#   FM_GITHUB_FEEDBACK_BASE_URL
+#   FM_GITHUB_FEEDBACK_EPOCH
+#   FM_GITHUB_FEEDBACK_TODAY
+#   FM_GITHUB_FEEDBACK_FETCH_TIMEOUT
+#   FM_GITHUB_FEEDBACK_GH_TIMEOUT
+#   FM_GITHUB_FEEDBACK_TOTAL_TIMEOUT
+#   FM_GITHUB_FEEDBACK_DISABLED=1
+# shellcheck disable=SC2016 # Node, GraphQL, and jq programs are intentionally literal.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+
+BASE_URL=${FM_GITHUB_FEEDBACK_BASE_URL:-https://matts-mac-mini.tail8a36c5.ts.net:8765/github-feedback}
+EPOCH=${FM_GITHUB_FEEDBACK_EPOCH:-2026-08-04}
+TODAY=${FM_GITHUB_FEEDBACK_TODAY:-$(TZ=America/Los_Angeles date +%F)}
+FETCH_TIMEOUT=${FM_GITHUB_FEEDBACK_FETCH_TIMEOUT:-8}
+GH_TIMEOUT=${FM_GITHUB_FEEDBACK_GH_TIMEOUT:-8}
+TOTAL_TIMEOUT=${FM_GITHUB_FEEDBACK_TOTAL_TIMEOUT:-20}
+REVIEWED="$STATE/github-feedback-reviewed-dates"
+PENDING="$STATE/github-feedback-pending-dates"
+
+usage() {
+  cat <<'EOF'
+usage: fm-github-feedback-intake.sh [--read-only]
+       fm-github-feedback-intake.sh acknowledge
+
+Fetch every unreviewed retained GitHub feedback date, recheck live candidates
+against current GitHub state, and print only dispatchable work or a visible
+source failure. The command never writes to GitHub or the producer ledger.
+
+Use `--read-only` to perform the same checks without changing local review
+records.
+
+Run `acknowledge` only after every item in the latest actionable output has
+been dispatched, deferred, found already under way, or escalated for a captain
+decision. In the default mode, valid empty and fully stale dates are recorded
+automatically.
+EOF
+}
+
+die() {
+  printf 'fm-github-feedback-intake: %s\n' "$*" >&2
+  exit 2
+}
+
+valid_positive_integer() {
+  case "$1" in ''|*[!0-9]*|0) return 1 ;; esac
+}
+
+valid_date() {
+  local year month day maximum
+  case "$1" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+    *) return 1 ;;
+  esac
+  IFS=- read -r year month day <<EOF
+$1
+EOF
+  year=$((10#$year))
+  month=$((10#$month))
+  day=$((10#$day))
+  [ "$month" -ge 1 ] && [ "$month" -le 12 ] || return 1
+  maximum=$(days_in_month "$year" "$month")
+  [ "$day" -ge 1 ] && [ "$day" -le "$maximum" ]
+}
+
+days_in_month() {
+  local year=$1 month=$2
+  case "$month" in
+    1|3|5|7|8|10|12) printf '31\n' ;;
+    4|6|9|11) printf '30\n' ;;
+    2)
+      if [ $((year % 400)) -eq 0 ] || { [ $((year % 4)) -eq 0 ] && [ $((year % 100)) -ne 0 ]; }; then
+        printf '29\n'
+      else
+        printf '28\n'
+      fi
+      ;;
+  esac
+}
+
+next_date() {
+  local value=$1 year month day maximum
+  IFS=- read -r year month day <<EOF
+$value
+EOF
+  year=$((10#$year))
+  month=$((10#$month))
+  day=$((10#$day))
+  maximum=$(days_in_month "$year" "$month")
+  if [ "$day" -lt "$maximum" ]; then
+    day=$((day + 1))
+  elif [ "$month" -lt 12 ]; then
+    month=$((month + 1))
+    day=1
+  else
+    year=$((year + 1))
+    month=1
+    day=1
+  fi
+  printf '%04d-%02d-%02d\n' "$year" "$month" "$day"
+}
+
+date_range() {
+  local current=$1 end=$2
+  [[ "$current" > "$end" ]] && return 0
+  while :; do
+    printf '%s\n' "$current"
+    [ "$current" = "$end" ] && return 0
+    current=$(next_date "$current")
+  done
+}
+
+friendly_date() {
+  if ! command -v node >/dev/null 2>&1; then
+    printf '%s' "$1"
+    return 0
+  fi
+  node -e '
+    const parsed = new Date(`${process.argv[1]}T00:00:00Z`);
+    process.stdout.write(new Intl.DateTimeFormat("en-US", {
+      month: "long", day: "numeric", year: "numeric", timeZone: "UTC"
+    }).format(parsed));
+  ' "$1"
+}
+
+reviewed_has() {
+  [ -f "$REVIEWED" ] && grep -Fqx -- "$1" "$REVIEWED" 2>/dev/null
+}
+
+mark_reviewed_from_file() {
+  local dates=$1 dir tmp
+  [ -s "$dates" ] || return 0
+  dir=$(dirname "$REVIEWED")
+  mkdir -p "$dir" || return 1
+  chmod 700 "$dir" 2>/dev/null || true
+  tmp=$(umask 077; mktemp "$dir/.github-feedback-reviewed.XXXXXX") || return 1
+  {
+    [ -f "$REVIEWED" ] && cat "$REVIEWED"
+    cat "$dates"
+  } | sed '/^$/d' | sort -u > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$REVIEWED"
+}
+
+write_pending() {
+  local dates=$1 dir tmp
+  dir=$(dirname "$PENDING")
+  mkdir -p "$dir" || return 1
+  chmod 700 "$dir" 2>/dev/null || true
+  if [ ! -s "$dates" ]; then
+    rm -f "$PENDING"
+    return 0
+  fi
+  tmp=$(umask 077; mktemp "$dir/.github-feedback-pending.XXXXXX") || return 1
+  sort -u "$dates" > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$PENDING"
+}
+
+acknowledge() {
+  [ -s "$PENDING" ] || die 'there is no reviewed overnight GitHub work awaiting acknowledgment'
+  mark_reviewed_from_file "$PENDING" || die 'could not record the reviewed dates'
+  last=$(tail -n 1 "$PENDING")
+  rm -f "$PENDING" || die 'could not clear the pending review record'
+  printf 'Overnight GitHub work recorded through %s.\n' "$last"
+}
+
+bounded() {
+  local seconds=$1
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$seconds" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$seconds" "$@"
+  elif command -v perl >/dev/null 2>&1; then
+    perl -e '
+      my $seconds = shift @ARGV;
+      my $pid = fork;
+      die "fork failed" unless defined $pid;
+      if (!$pid) { setpgrp(0, 0); exec @ARGV }
+      local $SIG{ALRM} = sub {
+        kill "TERM", -$pid;
+        select undef, undef, undef, 0.2;
+        kill "KILL", -$pid;
+        exit 124;
+      };
+      alarm $seconds;
+      waitpid $pid, 0;
+      exit($? >> 8);
+    ' "$seconds" "$@"
+  else
+    "$@"
+  fi
+}
+
+remaining_timeout() {
+  local maximum=$1 remaining
+  remaining=$((DEADLINE - $(date +%s)))
+  [ "$remaining" -gt 0 ] || return 1
+  if [ "$remaining" -lt "$maximum" ]; then
+    printf '%s\n' "$remaining"
+  else
+    printf '%s\n' "$maximum"
+  fi
+}
+
+decode_gh_axi_body() {
+  local input=$1 body truncated
+  truncated=$(sed -n 's/^  truncated: //p' "$input" | head -n 1)
+  [ "$truncated" = false ] || return 1
+  body=$(sed -n 's/^  body: //p' "$input" | head -n 1)
+  [ -n "$body" ] || return 1
+  case "$body" in
+    \"*) printf '%s\n' "$body" | jq -er . ;;
+    *) printf '%s\n' "$body" ;;
+  esac
+}
+
+cache_key() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+  else
+    printf '%s' "$1" | cksum | awk '{print $1 "-" $2}'
+  fi
+}
+
+query_pull_request() {
+  local owner=$1 repo=$2 number=$3 cache=$4 output rc query filter request_timeout
+  [ -f "$cache" ] && return 0
+  [ ! -e "$TMP/github-unavailable" ] || return 1
+  query='query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){state merged reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved isOutdated comments(first:100){pageInfo{hasNextPage} nodes{id isMinimized}}}} commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{__typename ... on CheckRun{id name status conclusion}}}}}}}}}}'
+  filter='.data.repository.pullRequest as $p |
+    if $p == null then "MISSING"
+    else
+      (["PR",$p.state,($p.merged|tostring),
+        (($p.reviewThreads.pageInfo.hasNextPage or any($p.reviewThreads.nodes[]?; .comments.pageInfo.hasNextPage))|tostring),
+        ((($p.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.hasNextPage) // false)|tostring)]|@tsv),
+      ($p.reviewThreads.nodes[]? | . as $thread | .comments.nodes[]? |
+        ["COMMENT",.id,($thread.isResolved|tostring),($thread.isOutdated|tostring),(.isMinimized|tostring),($thread.comments.pageInfo.hasNextPage|tostring)]|@tsv),
+      ($p.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]? |
+        select(.__typename == "CheckRun") | ["CHECK",.id,.name,.status,(.conclusion // "")]|@tsv)
+    end'
+  output="$TMP/gh-pr-$(cache_key "$owner/$repo/$number").out"
+  request_timeout=$(remaining_timeout "$GH_TIMEOUT") || return 1
+  if bounded "$request_timeout" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
+    gh-axi api POST graphql \
+      --field "query=$query" \
+      --field "owner=$owner" \
+      --field "repo=$repo" \
+      --field "number=$number" \
+      --jq "$filter" > "$output" 2>/dev/null; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [ "$rc" -ne 0 ] || ! decode_gh_axi_body "$output" > "$cache"; then
+    : > "$TMP/github-unavailable"
+    return 1
+  fi
+  [ -s "$cache" ]
+}
+
+query_issue() {
+  local owner=$1 repo=$2 number=$3 cache=$4 output rc query filter request_timeout
+  [ -f "$cache" ] && return 0
+  [ ! -e "$TMP/github-unavailable" ] || return 1
+  query='query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){issue(number:$number){state}}}'
+  filter='.data.repository.issue as $i | if $i == null then "MISSING" else ["ISSUE",$i.state]|@tsv end'
+  output="$TMP/gh-issue-$(cache_key "$owner/$repo/$number").out"
+  request_timeout=$(remaining_timeout "$GH_TIMEOUT") || return 1
+  if bounded "$request_timeout" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
+    gh-axi api POST graphql \
+      --field "query=$query" \
+      --field "owner=$owner" \
+      --field "repo=$repo" \
+      --field "number=$number" \
+      --jq "$filter" > "$output" 2>/dev/null; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [ "$rc" -ne 0 ] || ! decode_gh_axi_body "$output" > "$cache"; then
+    : > "$TMP/github-unavailable"
+    return 1
+  fi
+  [ -s "$cache" ]
+}
+
+reference_parts() {
+  printf '%s\n' "$1" | sed -nE \
+    's#^https://github\.com/([^/]+)/([^/]+)/(pull|issues)/([0-9]+)([/#?].*)?$#\1\t\2\t\3\t\4#p'
+}
+
+assess_pull_request() {
+  local owner=$1 repo=$2 number=$3 ids=$4 card=$5 key cache header kind state merged
+  local id row resolved status conclusion stable_name live=0 uncertain=0 evidence_count=0
+  key=$(cache_key "pull/$owner/$repo/$number")
+  cache="$TMP/cache-$key"
+  query_pull_request "$owner" "$repo" "$number" "$cache" || { printf 'error\n'; return; }
+  header=$(sed -n '1p' "$cache")
+  [ "$header" != MISSING ] || { printf 'stale\n'; return; }
+  IFS="$(printf '\t')" read -r kind state merged _ <<EOF
+$header
+EOF
+  [ "${kind:-}" = PR ] || { printf 'error\n'; return; }
+  [ "$state" = OPEN ] && [ "$merged" = false ] || { printf 'stale\n'; return; }
+
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    evidence_count=$((evidence_count + 1))
+    case "$id" in
+      PRRC_*)
+        row=$(awk -F '\t' -v want="$id" '$1 == "COMMENT" && $2 == want { print; exit }' "$cache")
+        if [ -n "$row" ]; then
+          IFS="$(printf '\t')" read -r _ _ resolved _outdated _minimized _comment_more <<EOF
+$row
+EOF
+          if [ "$resolved" = false ]; then
+            live=1
+          elif [ "$resolved" != true ]; then
+            uncertain=1
+          fi
+        else
+          uncertain=1
+        fi
+        ;;
+      CR_*|CHECK_*)
+        row=$(awk -F '\t' -v want="$id" '$1 == "CHECK" && $2 == want { print; exit }' "$cache")
+        if [ -z "$row" ]; then
+          stable_name=$(jq -r --arg id "$id" --arg repository "$owner/$repo" '
+            [.check_states[]? |
+              select(.github_object_id == $id and .repository == $repository and (.name | type == "string") and (.name | length > 0)) |
+              .name] |
+            unique |
+            if length == 1 then @tsv else empty end
+          ' "$card")
+          if [ -n "$stable_name" ]; then
+            row=$(awk -F '\t' -v want="$stable_name" '
+              $1 == "CHECK" && $3 == want { matched_row = $0; count += 1 }
+              END { if (count == 1) print matched_row }
+            ' "$cache")
+          fi
+        fi
+        if [ -n "$row" ]; then
+          IFS="$(printf '\t')" read -r _ _ _ status conclusion <<EOF
+$row
+EOF
+          case "$status:$conclusion" in
+            COMPLETED:SUCCESS|COMPLETED:NEUTRAL|COMPLETED:SKIPPED) ;;
+            *) live=1 ;;
+          esac
+        else
+          uncertain=1
+        fi
+        ;;
+      *)
+        # Top-level reviews and comments have no resolvable thread state.
+        # An open current pull request is the strongest deterministic signal.
+        live=1
+        ;;
+    esac
+  done < "$ids"
+
+  if [ "$evidence_count" -eq 0 ] || [ "$live" -eq 1 ]; then
+    printf 'live\n'
+  elif [ "$uncertain" -eq 1 ]; then
+    printf 'error\n'
+  else
+    printf 'stale\n'
+  fi
+}
+
+assess_issue() {
+  local owner=$1 repo=$2 number=$3 key cache line kind state
+  key=$(cache_key "issue/$owner/$repo/$number")
+  cache="$TMP/cache-$key"
+  query_issue "$owner" "$repo" "$number" "$cache" || { printf 'error\n'; return; }
+  line=$(sed -n '1p' "$cache")
+  [ "$line" != MISSING ] || { printf 'stale\n'; return; }
+  IFS="$(printf '\t')" read -r kind state <<EOF
+$line
+EOF
+  [ "$kind" = ISSUE ] || { printf 'error\n'; return; }
+  if [ "$state" = OPEN ]; then printf 'live\n'; else printf 'stale\n'; fi
+}
+
+assess_item() {
+  local item=$1 card=$2 refs ids parts owner repo kind number verdict any=0 uncertain=0
+  refs="$TMP/item-refs"
+  ids="$TMP/item-ids"
+  printf '%s' "$item" | jq -r '.references[]?.url // empty' > "$refs"
+  printf '%s' "$item" | jq -r '.evidence_event_ids[]? // empty' > "$ids"
+  [ -s "$refs" ] || { printf 'error\n'; return; }
+  while IFS= read -r url; do
+    parts=$(reference_parts "$url")
+    if [ -z "$parts" ]; then
+      uncertain=1
+      continue
+    fi
+    IFS="$(printf '\t')" read -r owner repo kind number <<EOF
+$parts
+EOF
+    case "$kind" in
+      pull) verdict=$(assess_pull_request "$owner" "$repo" "$number" "$ids" "$card") ;;
+      issues) verdict=$(assess_issue "$owner" "$repo" "$number") ;;
+      *) verdict=error ;;
+    esac
+    case "$verdict" in
+      live) any=1 ;;
+      error) uncertain=1 ;;
+    esac
+  done < "$refs"
+  if [ "$any" -eq 1 ]; then
+    printf 'live\n'
+  elif [ "$uncertain" -eq 1 ]; then
+    printf 'error\n'
+  else
+    printf 'stale\n'
+  fi
+}
+
+fetch_card() {
+  local day=$1 destination=$2 errors=$3 url code rc request_timeout
+  url="${BASE_URL%/}/$day/card.json"
+  request_timeout=$(remaining_timeout "$FETCH_TIMEOUT") || return 13
+  if code=$(curl --silent --show-error --location --head --output /dev/null \
+    --write-out '%{http_code}' --connect-timeout 3 --max-time "$request_timeout" \
+    "$url" 2> "$errors"); then
+    rc=0
+  else
+    rc=$?
+  fi
+  [ "$rc" -eq 0 ] || return 10
+  case "$code" in
+    200) ;;
+    404) return 11 ;;
+    *) return 12 ;;
+  esac
+  request_timeout=$(remaining_timeout "$FETCH_TIMEOUT") || return 13
+  if code=$(curl --silent --show-error --location --output "$destination" \
+    --write-out '%{http_code}' --connect-timeout 3 --max-time "$request_timeout" \
+    "$url" 2> "$errors"); then
+    rc=0
+  else
+    rc=$?
+  fi
+  [ "$rc" -eq 0 ] || return 10
+  case "$code" in
+    200) ;;
+    404) return 11 ;;
+    *) return 12 ;;
+  esac
+}
+
+validate_card() {
+  local card=$1 day=$2
+  jq -e --arg day "$day" '
+    def normalized_text:
+      tostring |
+      gsub("[\u0000-\u001f\u007f]+"; " ") |
+      gsub("\u2063"; "") |
+      gsub("  +"; " ") |
+      gsub("^ +| +$"; "");
+    def nonempty_string: type == "string" and (normalized_text | length > 0);
+    def safe_visible_text:
+      type == "string" and
+      (normalized_text as $text |
+        ($text | length > 0) and
+        ($text | test("https?://|github\\.com|(^|[^[:alnum:]_])#[0-9]+|\\b(PR|pull request|issue)[[:space:]]*#?[0-9]+\\b|\\b(PRRC_|PRC_|IRC_|IC_|CR_|CHECK_)[[:alnum:]_-]*|\\b(Firstmate|secondmate|crewmate|Ringer|no-mistakes|fm-[[:alnum:]_-]+)\\b|`"; "i") | not));
+    def reference:
+      type == "object" and
+      (.label | nonempty_string) and
+      (.url | nonempty_string and test("^https://github\\.com/[^/]+/[^/]+/(pull|issues)/[0-9]+([/#?].*)?$"));
+    def evidence_ids:
+      type == "array" and length > 0 and all(.[]; nonempty_string);
+    def item:
+      type == "object" and
+      (.headline | safe_visible_text) and
+      (.action | safe_visible_text) and
+      (.consequence | safe_visible_text) and
+      (.priority == "high" or .priority == "medium" or .priority == "low") and
+      .status == "live" and
+      (.status_reason == null or (.status_reason | nonempty_string)) and
+      (.references | type == "array" and length > 0 and all(.[]; reference)) and
+      (.evidence_event_ids | evidence_ids);
+    def project:
+      type == "object" and
+      (.repository | nonempty_string and test("^[^/[:space:]]+/[^/[:space:]]+$")) and
+      (.project_name | safe_visible_text) and
+      (.work_items | type == "array" and all(.[]; item));
+    def decision:
+      type == "object" and
+      (.decision | safe_visible_text) and
+      (.why_only_captain | safe_visible_text) and
+      (.references | type == "array" and length > 0 and all(.[]; reference)) and
+      (.evidence_event_ids | evidence_ids);
+    type == "object" and
+    .schema_version == "github-feedback-card.v1" and
+    .card_date == $day and
+    (.status == "ready" or .status == "empty") and
+    (.projects | type == "array" and all(.[]; project)) and
+    (.captain_needed | type == "array" and all(.[]; decision)) and
+    (if .status == "empty" then
+      ([.projects[].work_items[]] | length) == 0 and
+      (.captain_needed | length) == 0
+    else
+      (([.projects[].work_items[]] | length) + (.captain_needed | length)) > 0
+    end)
+  ' "$card" >/dev/null 2>&1
+}
+
+append_failure() {
+  jq -nc --arg date "$1" --arg detail "$2" '{date:$date,detail:$detail}' >> "$FAILURES"
+}
+
+emit_failures() {
+  [ -s "$FAILURES" ] || return 0
+  printf 'OVERNIGHT GITHUB WORK UNAVAILABLE\n\n'
+  while IFS="$(printf '\t')" read -r day detail; do
+    printf -- '- %s: %s\n' "$(friendly_date "$day")" "$detail"
+  done < <(jq -rs 'sort_by(.date)[] | [.date,.detail] | @tsv' "$FAILURES")
+  printf '\nThis is missing input, not a quiet day.\n'
+}
+
+emit_dependency_failures() {
+  local dates=$1 day
+  printf 'OVERNIGHT GITHUB WORK UNAVAILABLE\n\n'
+  while IFS= read -r day; do
+    printf -- '- %s: a required local dependency is unavailable, so the retained work could not be checked\n' "$day"
+  done < "$dates"
+  printf '\nThis is missing input, not a quiet day.\n'
+}
+
+emit_work() {
+  local read_only=$1 suffix
+  [ -s "$SURVIVORS" ] || return 0
+  if [ "$read_only" -eq 1 ]; then
+    suffix='Every item above remains current and needs review.'
+  else
+    suffix='Every item above remains current and needs resolution.'
+  fi
+  jq -rs --arg suffix "$suffix" '
+    def clean: tostring | gsub("[\u0000-\u001f\u007f]+"; " ") | gsub("\u2063"; "") | gsub("  +"; " ") | gsub("^ +| +$"; "");
+    def rank: if .priority == "high" then 0 elif .priority == "medium" then 1 else 2 end;
+    (group_by(.identity) | map(max_by(.date))) as $all |
+    [$all[] | select(.kind == "job")] as $jobs |
+    [$all[] | select(.kind == "captain")] as $captain |
+    "OVERNIGHT GITHUB WORK\n\n" +
+    (if ($jobs | length) > 0 then
+      ($jobs | group_by(.project) |
+        sort_by([(map(rank) | min), .[0].project]) |
+        map((.[0].project | clean) + "\n" +
+          (sort_by([rank,.headline]) |
+            map("- " + (.headline | clean) + "\n  Work: " + (.action | clean) + "\n  Consequence: " + (.consequence | clean)) |
+            join("\n"))) |
+        join("\n\n"))
+    else "" end) +
+    (if ($captain | length) > 0 then
+      (if ($jobs | length) > 0 then "\n\n" else "" end) +
+      "Needs Matt\n" +
+      ($captain | sort_by(.headline) |
+        map("- " + (.headline | clean) + "\n  Why: " + (.consequence | clean)) |
+        join("\n"))
+    else "" end) +
+    "\n\n" + $suffix
+  ' "$SURVIVORS"
+  printf '\n'
+}
+
+collect() {
+  local read_only=$1 day card fetch_errors rc status rows row project item verdict
+  local day_survivors day_error day_live unreviewed
+
+  if [ "${FM_GITHUB_FEEDBACK_DISABLED:-0}" = 1 ]; then
+    return 0
+  fi
+  valid_positive_integer "$FETCH_TIMEOUT" || die 'FM_GITHUB_FEEDBACK_FETCH_TIMEOUT must be a positive integer'
+  valid_positive_integer "$GH_TIMEOUT" || die 'FM_GITHUB_FEEDBACK_GH_TIMEOUT must be a positive integer'
+  valid_positive_integer "$TOTAL_TIMEOUT" || die 'FM_GITHUB_FEEDBACK_TOTAL_TIMEOUT must be a positive integer'
+  valid_date "$EPOCH" || die 'FM_GITHUB_FEEDBACK_EPOCH must be YYYY-MM-DD'
+  valid_date "$TODAY" || die 'FM_GITHUB_FEEDBACK_TODAY must be YYYY-MM-DD'
+
+  unreviewed="$TMP/unreviewed-dates"
+  : > "$unreviewed"
+  while IFS= read -r day; do
+    [ -n "$day" ] || continue
+    reviewed_has "$day" || printf '%s\n' "$day" >> "$unreviewed"
+  done < <(date_range "$EPOCH" "$TODAY")
+  if [ ! -s "$unreviewed" ]; then
+    [ "$read_only" -eq 1 ] || write_pending "$NEW_PENDING" || die 'could not clear the actionable local review record'
+    return 0
+  fi
+
+  for tool in curl jq gh-axi; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      emit_dependency_failures "$unreviewed"
+      return 0
+    fi
+  done
+  DEADLINE=$(($(date +%s) + TOTAL_TIMEOUT))
+
+  while IFS= read -r day; do
+    [ -n "$day" ] || continue
+    card="$TMP/card-$day.json"
+    fetch_errors="$TMP/fetch-$day.err"
+    if fetch_card "$day" "$card" "$fetch_errors"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    case "$rc" in
+      0) ;;
+      10)
+        append_failure "$day" 'the retained overnight work could not be reached from this laptop'
+        continue
+        ;;
+      11)
+        append_failure "$day" 'no completed overnight work was available for this date'
+        continue
+        ;;
+      13)
+        append_failure "$day" 'the retained overnight input could not be fully fetched within the available time'
+        break
+        ;;
+      *)
+        append_failure "$day" 'the retained overnight work returned an unexpected response'
+        continue
+        ;;
+    esac
+    if ! validate_card "$card" "$day"; then
+      append_failure "$day" 'the retained overnight work did not match the required complete-card contract'
+      continue
+    fi
+    status=$(jq -r '.status' "$card")
+    if [ "$status" = empty ]; then
+      printf '%s\n' "$day" >> "$AUTO_REVIEWED"
+      continue
+    fi
+
+    day_survivors="$TMP/survivors-$day.jsonl"
+    : > "$day_survivors"
+    day_error=0
+    day_live=0
+    rows="$TMP/rows-$day.jsonl"
+    jq -c '
+      .projects[]? as $project |
+      $project.work_items[]? |
+      select(.status == "live") |
+      {kind:"job",project:($project.project_name // $project.repository),repository:$project.repository,item:.}
+    ' "$card" > "$rows"
+    while IFS= read -r row; do
+      [ -n "$row" ] || continue
+      project=$(printf '%s' "$row" | jq -r '.project')
+      item=$(printf '%s' "$row" | jq -c '.item')
+      verdict=$(assess_item "$item" "$card")
+      case "$verdict" in
+        live)
+          day_live=1
+          printf '%s' "$row" | jq -c --arg date "$day" '{
+            kind,
+            project,
+            repository,
+            date:$date,
+            identity:{kind,repository,references:(.item.references | map(.url) | sort),evidence_event_ids:(.item.evidence_event_ids | sort)},
+            headline:.item.headline,
+            action:.item.action,
+            consequence:.item.consequence,
+            priority:(.item.priority // "medium")
+          }' >> "$day_survivors"
+          ;;
+        error)
+          day_error=1
+          append_failure "$day" "current GitHub state could not be checked for $project - $(printf '%s' "$item" | jq -r '.headline')"
+          ;;
+      esac
+    done < "$rows"
+
+    jq -c '
+      .captain_needed[]? |
+      {kind:"captain",project:"Needs Matt",repository:"",item:{headline:.decision,action:.decision,consequence:.why_only_captain,priority:"high",references:.references,evidence_event_ids:.evidence_event_ids}}
+    ' "$card" > "$rows"
+    while IFS= read -r row; do
+      [ -n "$row" ] || continue
+      item=$(printf '%s' "$row" | jq -c '.item')
+      verdict=$(assess_item "$item" "$card")
+      case "$verdict" in
+        live)
+          day_live=1
+          printf '%s' "$row" | jq -c --arg date "$day" '{
+            kind,
+            project,
+            repository,
+            date:$date,
+            identity:{kind,repository,references:(.item.references | map(.url) | sort),evidence_event_ids:(.item.evidence_event_ids | sort)},
+            headline:.item.headline,
+            action:.item.action,
+            consequence:.item.consequence,
+            priority:"high"
+          }' >> "$day_survivors"
+          ;;
+        error)
+          day_error=1
+          append_failure "$day" "current GitHub state could not be checked for a decision that may still need Matt"
+          ;;
+      esac
+    done < "$rows"
+
+    if [ "$day_error" -eq 1 ]; then
+      continue
+    fi
+    if [ "$day_live" -eq 1 ]; then
+      cat "$day_survivors" >> "$SURVIVORS"
+      printf '%s\n' "$day" >> "$NEW_PENDING"
+    else
+      printf '%s\n' "$day" >> "$AUTO_REVIEWED"
+    fi
+  done < "$unreviewed"
+
+  if [ "$read_only" -eq 0 ]; then
+    mark_reviewed_from_file "$AUTO_REVIEWED" || append_failure "$EPOCH" 'the completed local review could not be recorded'
+    write_pending "$NEW_PENDING" || append_failure "$EPOCH" 'the actionable local review could not be recorded'
+  fi
+  emit_work "$read_only"
+  if [ -s "$SURVIVORS" ] && [ -s "$FAILURES" ]; then printf '\n'; fi
+  emit_failures
+}
+
+MODE=collect
+READ_ONLY=0
+case "${1:-}" in
+  '') ;;
+  --read-only) READ_ONLY=1 ;;
+  acknowledge) MODE=acknowledge ;;
+  -h|--help) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+[ $# -le 1 ] || { usage >&2; exit 2; }
+
+if [ "$MODE" = acknowledge ]; then
+  acknowledge
+  exit 0
+fi
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/fm-github-feedback-intake.XXXXXX") || die 'could not create a private temporary directory'
+trap 'rm -rf "$TMP"' EXIT INT TERM
+SURVIVORS="$TMP/survivors.jsonl"
+FAILURES="$TMP/failures.jsonl"
+AUTO_REVIEWED="$TMP/auto-reviewed"
+NEW_PENDING="$TMP/new-pending"
+: > "$SURVIVORS"
+: > "$FAILURES"
+: > "$AUTO_REVIEWED"
+: > "$NEW_PENDING"
+
+collect "$READ_ONLY"

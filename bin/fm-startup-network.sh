@@ -18,10 +18,11 @@
 # owner of every one of these sweeps and still runs all of them, unchanged, via
 # its FM_BOOTSTRAP_NETWORK=only phase. Deferral changes WHEN they run, not
 # WHETHER, and three properties make the later run safe:
-#   - The sweeps are idempotent DETECTORS. A run whose report is lost (killed
-#     worker, truncated digest, crashed session) loses no finding: the next run
-#     re-derives the same dead secondmate, the same stuck clone, the same
-#     undelivered handoff. There is no once-only signal to miss.
+#   - The sweeps are idempotent, and feedback intake's local review recording is
+#     idempotent. A run whose report is lost (killed worker, truncated digest,
+#     crashed session) loses no finding: the next run re-derives the same dead
+#     secondmate, stuck clone, undelivered handoff, and still-pending actionable
+#     feedback. Valid empty and fully stale feedback has no finding to preserve.
 #   - The result is durable and always surfaces. It lands in
 #     state/.startup-network.report and reaches the agent either inline in the
 #     digest or as a `check: startup-network` wake. Only a durable acknowledgement
@@ -162,9 +163,16 @@ worker_alive() {
 phase_label() {  # <phases>
   case "$1" in
     probe) printf 'GitHub authentication' ;;
+    probe,feedback) printf 'GitHub authentication and retained GitHub feedback intake' ;;
     probe,sweeps) printf 'GitHub authentication, dead-secondmate relaunch, secondmate convergence, pending handoff delivery, and project clone refresh with its drift reporting' ;;
+    probe,sweeps,feedback) printf 'GitHub authentication, retained GitHub feedback intake, dead-secondmate relaunch, secondmate convergence, pending handoff delivery, and project clone refresh with its drift reporting' ;;
     *) printf 'the deferred network checks' ;;
   esac
+}
+
+feedback_enabled() {
+  [ ! -e "$FM_HOME/.fm-secondmate-home" ] \
+    && [ "${FM_GITHUB_FEEDBACK_DISABLED:-0}" != 1 ]
 }
 
 # --- start -------------------------------------------------------------------
@@ -196,6 +204,9 @@ cmd_start() {  # <locked> <harvest-pid>
   started=$(now)
   phases=probe
   [ "$locked" != 1 ] || phases=probe,sweeps
+  if feedback_enabled; then
+    phases=$phases,feedback
+  fi
   if ! write_atomic "$STATUS_FILE" <<EOF
 state=running
 pid=0
@@ -352,6 +363,15 @@ EOF
   await_delivery "$generation" "$state"
 }
 
+cmd_checks() {
+  local bootstrap_rc=0 feedback_rc=0
+  "$SCRIPT_DIR/fm-bootstrap.sh" || bootstrap_rc=$?
+  if feedback_enabled; then
+    "$SCRIPT_DIR/fm-github-feedback-intake.sh" || feedback_rc=$?
+  fi
+  [ "$bootstrap_rc" -eq 0 ] && [ "$feedback_rc" -eq 0 ]
+}
+
 cmd_run() {  # <locked> <lock-pid> <generation>
   local locked=$1 lock_pid=$2 generation=$3 phases started budget out rc sweep_locked=0 downgraded=0 internal=0 lease_held=0
   mkdir -p "$STATE" 2>/dev/null || return 1
@@ -378,6 +398,9 @@ cmd_run() {  # <locked> <lock-pid> <generation>
     else
       downgraded=1
     fi
+  fi
+  if feedback_enabled; then
+    phases=$phases,feedback
   fi
 
   if [ "$internal" -eq 0 ]; then
@@ -410,13 +433,16 @@ EOF
       downgraded=1
     fi
   fi
+  if feedback_enabled && [ "${phases##*,}" != feedback ]; then
+    phases=$phases,feedback
+  fi
   if [ "$sweep_locked" -eq 1 ]; then
     fm_run_timed "$budget" env FM_BOOTSTRAP_NETWORK=only \
       FM_BOOTSTRAP_NETWORK_LOCK_PID="$lock_pid" \
-      "$SCRIPT_DIR/fm-bootstrap.sh" >"$out" 2>&1 || rc=$?
+      "$SCRIPT_DIR/fm-startup-network.sh" checks >"$out" 2>&1 || rc=$?
   else
     fm_run_timed "$budget" env FM_BOOTSTRAP_NETWORK=only FM_BOOTSTRAP_DETECT_ONLY=1 \
-      "$SCRIPT_DIR/fm-bootstrap.sh" >"$out" 2>&1 || rc=$?
+      "$SCRIPT_DIR/fm-startup-network.sh" checks >"$out" 2>&1 || rc=$?
   fi
   [ "$lease_held" -eq 0 ] || fm_lock_release "$STATE/.lock.acquire"
 
@@ -555,6 +581,7 @@ case "$LOCKED" in 0|1) ;; *) LOCKED=0 ;; esac
 
 case "$MODE" in
   start) cmd_start "$LOCKED" "${HARVEST_PID:-0}" ;;
+  checks) cmd_checks ;;
   run) cmd_run "$LOCKED" "$LOCK_PID" "$GENERATION" ;;
   harvest) cmd_harvest "${HARVEST_PID:-}" ;;
   report) print_state ;;

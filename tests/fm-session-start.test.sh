@@ -1483,6 +1483,109 @@ EOF
   pass "session start: the tasks-axi compatibility verdict is computed once and reused"
 }
 
+run_session_start_with_github_feedback() {
+  local home=$1 root=$2 fakebin=$3
+  FM_FAKE_HARNESS_PID=$$ \
+    FM_GITHUB_FEEDBACK_DISABLED=0 \
+    FM_GITHUB_FEEDBACK_EPOCH=2026-08-04 \
+    FM_GITHUB_FEEDBACK_TODAY=2026-08-04 \
+    FM_GITHUB_FEEDBACK_BASE_URL=https://fixture.invalid/github-feedback \
+    FM_TEST_FEEDBACK_CARD="$home/card.json" \
+    run_session_start "$home" "$root" "$fakebin:$BASE_PATH"
+}
+
+test_github_feedback_intake_surfaces_in_deferred_startup_report() {
+  local rec root home fakebin out report second network_line context_line
+  rec=$(new_world github-feedback-intake)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  make_fake_tmux "$fakebin" 'unused'
+
+  cat > "$fakebin/node" <<SH
+#!/usr/bin/env bash
+exec "$REAL_NODE" "\$@"
+SH
+  cat > "$fakebin/jq" <<SH
+#!/usr/bin/env bash
+exec "$REAL_JQ" "\$@"
+SH
+  cat > "$fakebin/curl" <<'SH'
+#!/usr/bin/env bash
+set -u
+output=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --output) shift; output=${1:-} ;;
+    --write-out|--connect-timeout|--max-time) shift ;;
+  esac
+  shift
+done
+if [ -n "$output" ] && [ "$output" != /dev/null ]; then
+  cp "${FM_TEST_FEEDBACK_CARD:?}" "$output"
+fi
+printf '200'
+SH
+  cat > "$fakebin/gh-axi" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  printf '%s\n' '0.1.29'
+  exit 0
+fi
+cat <<'OUT'
+api_response:
+  body: "PR\tOPEN\tfalse\tfalse\tfalse"
+  truncated: false
+OUT
+SH
+  chmod +x "$fakebin/node" "$fakebin/jq" "$fakebin/curl" "$fakebin/gh-axi"
+
+  cat > "$home/card.json" <<'JSON'
+{
+  "schema_version": "github-feedback-card.v1",
+  "card_date": "2026-08-04",
+  "status": "ready",
+  "projects": [{
+    "repository": "owner/startup-project",
+    "project_name": "Startup Project",
+    "work_items": [{
+      "headline": "Restore readable startup output",
+      "action": "Correct the rendering regression.",
+      "consequence": "The morning work list is hard to read.",
+      "priority": "high",
+      "status": "live",
+      "status_reason": null,
+      "references": [{"label": "source", "url": "https://github.com/owner/startup-project/pull/44"}],
+      "evidence_event_ids": ["PRC_startup"]
+    }]
+  }],
+  "captain_needed": []
+}
+JSON
+
+  out=$(run_session_start_with_github_feedback "$home" "$root" "$fakebin")
+  network_line=$(printf '%s\n' "$out" | grep -n '^NETWORK CHECKS$' | head -n 1 | cut -d: -f1)
+  context_line=$(printf '%s\n' "$out" | grep -n '^CONTEXT$' | head -n 1 | cut -d: -f1)
+  [ "$network_line" -lt "$context_line" ] || fail 'deferred nightly work was buried after the context digest'
+
+  wait_for_network_stage "$home" "$root" 60 || fail 'the deferred feedback intake never finished'
+  report=$(network_stage_report "$home" "$root")
+  assert_contains "$report" 'OVERNIGHT GITHUB WORK' 'actionable nightly work did not reach the deferred startup report'
+  assert_contains "$report" 'Startup Project' 'deferred startup report lost the project grouping'
+  assert_contains "$report" 'Restore readable startup output' 'deferred startup report lost the dispatchable job'
+  assert_not_contains "$report" 'pull/44' 'deferred startup report leaked a GitHub identifier into the job output'
+
+  FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+    "$ROOT/bin/fm-github-feedback-intake.sh" acknowledge >/dev/null
+  run_session_start_with_github_feedback "$home" "$root" "$fakebin" >/dev/null
+  wait_for_network_stage "$home" "$root" 60 || fail 'the second deferred feedback intake never finished'
+  second=$(network_stage_report "$home" "$root")
+  assert_not_contains "$second" 'OVERNIGHT GITHUB WORK' 'completed nightly work left duplicate deferred startup output'
+  pass 'actionable nightly GitHub work reaches the deferred startup report, then stays silent after review'
+}
+
 # --- fleet-state digest: compact backlog rendering --------------------------
 
 # A backlog whose Done section, held row, blocked row, and plain queued rows can
@@ -2204,6 +2307,7 @@ test_orphan_status_logs_are_printed
 test_endpoint_liveness_tmux
 test_endpoint_liveness_herdr
 test_composition_invokes_real_scripts
+test_github_feedback_intake_surfaces_in_deferred_startup_report
 test_backlog_compact_tasks_axi_omits_bodies_and_keeps_metadata
 test_backlog_queued_bound_discloses_its_remainder
 test_backlog_compact_manual_backend_skips_indented_bodies
