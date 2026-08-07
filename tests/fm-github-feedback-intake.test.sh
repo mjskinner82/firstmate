@@ -475,6 +475,29 @@ EOF
   pass 'an unmatched check without stable identity fails closed'
 }
 
+test_ambiguous_replacement_check_is_uncertain() {
+  local record dir fakebin out updated
+  record=$(make_world ambiguous-replacement-check)
+  IFS='|' read -r dir fakebin <<EOF
+$record
+EOF
+  write_ready_card "$dir/cards/2026-08-04.json" 2026-08-04 'Ambiguous Check Project' 'owner/ambiguous' \
+    'Repair the ambiguous check' 'Correct the check failure.' 'The current result cannot be verified.' \
+    'https://github.com/owner/ambiguous/pull/37' 'CR_old'
+  updated="$dir/cards/2026-08-04.updated.json"
+  jq '.check_states = [{github_object_id:"CR_old",repository:"owner/ambiguous",name:"Tests",status:"completed",conclusion:"failure"}]' \
+    "$dir/cards/2026-08-04.json" > "$updated"
+  mv "$updated" "$dir/cards/2026-08-04.json"
+  write_pr_state "$dir/gh/owner--ambiguous--37.out" $'PR\tOPEN\tfalse\tfalse\tfalse\nCHECK\tCR_success\tTests\tCOMPLETED\tSUCCESS\nCHECK\tCR_failure\tTests\tCOMPLETED\tFAILURE'
+
+  out=$(run_intake "$dir" "$fakebin" 2026-08-04)
+  assert_contains "$out" 'OVERNIGHT GITHUB WORK UNAVAILABLE' 'ambiguous replacement checks were not reported as uncertain'
+  assert_contains "$out" 'current GitHub state could not be checked' 'ambiguous replacement checks lacked current-state detail'
+  assert_absent "$dir/home/state/github-feedback-reviewed-dates" 'ambiguous replacement checks were marked reviewed'
+  assert_absent "$dir/home/state/github-feedback-pending-dates" 'ambiguous replacement checks became actionable'
+  pass 'multiple replacement checks with one name fail closed'
+}
+
 test_dependency_failure_reports_only_unreviewed_dates() {
   local record dir fakebin out
   record=$(make_world dependency-pending-dates)
@@ -485,11 +508,34 @@ EOF
   rm "$fakebin/gh-axi"
 
   out=$(PATH=/usr/bin:/bin run_intake "$dir" "$fakebin" 2026-08-06)
-  assert_not_contains "$out" 'August 4, 2026' 'dependency failure named an already reviewed date'
-  assert_contains "$out" 'August 5, 2026' 'dependency failure omitted the first pending date'
-  assert_contains "$out" 'August 6, 2026' 'dependency failure omitted the second pending date'
+  assert_not_contains "$out" '2026-08-04' 'dependency failure named an already reviewed date'
+  assert_contains "$out" '2026-08-05' 'dependency failure omitted the first pending date'
+  assert_contains "$out" '2026-08-06' 'dependency failure omitted the second pending date'
   assert_absent "$dir/home/state/github-feedback-pending-dates" 'dependency failure created actionable state'
   pass 'dependency failures report every genuinely pending date'
+}
+
+test_missing_jq_reports_pending_dates() {
+  local record dir fakebin out limited tool target
+  record=$(make_world missing-jq)
+  IFS='|' read -r dir fakebin <<EOF
+$record
+EOF
+  printf '%s\n' '2026-08-04' > "$dir/home/state/github-feedback-reviewed-dates"
+  limited="$dir/no-jq-bin"
+  mkdir -p "$limited"
+  for tool in bash dirname grep mktemp rm; do
+    target=$(command -v "$tool")
+    ln -s "$target" "$limited/$tool"
+  done
+
+  out=$(PATH="$limited" run_intake "$dir" "$fakebin" 2026-08-06)
+  assert_not_contains "$out" '2026-08-04' 'missing jq output named an already reviewed date'
+  assert_contains "$out" '2026-08-05' 'missing jq output omitted the first pending date'
+  assert_contains "$out" '2026-08-06' 'missing jq output omitted the second pending date'
+  assert_contains "$out" 'OVERNIGHT GITHUB WORK UNAVAILABLE' 'missing jq suppressed the unavailable section'
+  assert_contains "$out" 'missing input, not a quiet day' 'missing jq could be mistaken for an empty day'
+  pass 'missing jq reports pending dates without JSON serialization'
 }
 
 test_dependency_failure_is_silent_when_all_dates_are_reviewed() {
@@ -521,7 +567,9 @@ test_resolved_thread_is_dropped_silently
 test_unresolved_outdated_thread_remains_live
 test_replacement_check_uses_stable_identity
 test_unmatched_check_without_identity_is_uncertain
+test_ambiguous_replacement_check_is_uncertain
 test_dependency_failure_reports_only_unreviewed_dates
+test_missing_jq_reports_pending_dates
 test_dependency_failure_is_silent_when_all_dates_are_reviewed
 
 echo '# fm-github-feedback-intake.test.sh: all assertions passed'

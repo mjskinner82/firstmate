@@ -363,7 +363,10 @@ EOF
             if length == 1 then @tsv else empty end
           ' "$card")
           if [ -n "$stable_name" ]; then
-            row=$(awk -F '\t' -v want="$stable_name" '$1 == "CHECK" && $3 == want { print; exit }' "$cache")
+            row=$(awk -F '\t' -v want="$stable_name" '
+              $1 == "CHECK" && $3 == want { matched_row = $0; count += 1 }
+              END { if (count == 1) print matched_row }
+            ' "$cache")
           fi
         fi
         if [ -n "$row" ]; then
@@ -547,6 +550,15 @@ emit_failures() {
   printf '\nThis is missing input, not a quiet day.\n'
 }
 
+emit_dependency_failures() {
+  local dates=$1 day
+  printf 'OVERNIGHT GITHUB WORK UNAVAILABLE\n\n'
+  while IFS= read -r day; do
+    printf -- '- %s: a required local dependency is unavailable, so the retained work could not be checked\n' "$day"
+  done < "$dates"
+  printf '\nThis is missing input, not a quiet day.\n'
+}
+
 emit_work() {
   local read_only=$1 suffix
   [ -s "$SURVIVORS" ] || return 0
@@ -609,10 +621,7 @@ collect() {
 
   for tool in curl jq gh-axi; do
     if ! command -v "$tool" >/dev/null 2>&1; then
-      while IFS= read -r day; do
-        append_failure "$day" 'a required local dependency is unavailable, so the retained work could not be checked'
-      done < "$unreviewed"
-      emit_failures
+      emit_dependency_failures "$unreviewed"
       return 0
     fi
   done
