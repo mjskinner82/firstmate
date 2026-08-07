@@ -127,6 +127,40 @@ test_record_refuses_invalid_input_and_duplicates() {
   pass "record refuses unsafe inputs and duplicate run rows without appending"
 }
 
+test_concurrent_records_allow_one_run_row() {
+  local home ledger pid rc successes failures
+  local -a pids
+  home="$TMP_ROOT/concurrent-records"
+  ledger=$(ledger_for "$home")
+  pids=()
+  successes=0
+  failures=0
+
+  for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    FM_HOME="$home" "$GRADE" record dead-code-cleanup concurrent-task \
+      --outcome merged_clean > /dev/null 2>&1 &
+    pids+=("$!")
+  done
+
+  set +e
+  for pid in "${pids[@]}"; do
+    wait "$pid"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      successes=$((successes + 1))
+    else
+      failures=$((failures + 1))
+    fi
+  done
+  set -e
+
+  [ "$successes" -eq 1 ] || fail "concurrent duplicate records produced $successes successes"
+  [ "$failures" -eq 19 ] || fail "concurrent duplicate records produced $failures refusals"
+  [ "$(wc -l < "$ledger" | tr -d ' ')" -eq 1 ] \
+    || fail "concurrent duplicate records appended more than one row"
+  pass "concurrent records serialize duplicate checking and append"
+}
+
 test_malformed_ledger_refuses_record_and_report() {
   local home ledger before after rc
   home="$TMP_ROOT/malformed-ledger"
@@ -154,7 +188,41 @@ test_malformed_ledger_refuses_record_and_report() {
   pass "malformed rows fail closed for both report and record"
 }
 
+test_duplicate_ledger_keys_refuse_record_and_report() {
+  local home ledger before after rc
+  home="$TMP_ROOT/duplicate-ledger"
+  ledger=$(ledger_for "$home")
+  mkdir -p "$(dirname "$ledger")"
+  cat > "$ledger" <<'EOF'
+{"agent":"test-coverage","task_id":"duplicate-task","pr_url":"","outcome":"merged_clean","false_positive_labels":[],"timestamp":"2026-08-01T00:00:00Z","note":""}
+{"agent":"test-coverage","task_id":"duplicate-task","pr_url":"","outcome":"rejected","false_positive_labels":[],"timestamp":"2026-08-02T00:00:00Z","note":""}
+EOF
+  before=$(shasum -a 256 "$ledger" | awk '{print $1}')
+
+  set +e
+  FM_HOME="$home" "$GRADE" report > "$home/report.out" 2> "$home/report.err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "report silently accepted duplicate ledger keys"
+  assert_grep "malformed ledger row at line 2: duplicate agent/task key" "$home/report.err" \
+    "report did not identify the duplicate ledger key"
+
+  set +e
+  FM_HOME="$home" "$GRADE" record test-coverage new-task --outcome rejected \
+    > "$home/record.out" 2> "$home/record.err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "record appended to a ledger with duplicate keys"
+  assert_grep "malformed ledger row at line 2: duplicate agent/task key" "$home/record.err" \
+    "record did not identify the duplicate ledger key"
+  after=$(shasum -a 256 "$ledger" | awk '{print $1}')
+  [ "$after" = "$before" ] || fail "record changed a ledger with duplicate keys"
+  pass "duplicate ledger keys fail closed for both report and record"
+}
+
 test_report_math_and_filter
 test_record_writes_valid_private_row
 test_record_refuses_invalid_input_and_duplicates
+test_concurrent_records_allow_one_run_row
 test_malformed_ledger_refuses_record_and_report
+test_duplicate_ledger_keys_refuse_record_and_report

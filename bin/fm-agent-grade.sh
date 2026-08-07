@@ -61,11 +61,13 @@ exec python3 - "$LEDGER" "$@" <<'PY'
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
 import sys
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -171,15 +173,34 @@ def load_records(path: Path) -> list[dict[str, object]]:
         line_number = raw.count("\n") + 1
         fail(f"malformed ledger row at line {line_number}: final row is not newline-terminated")
     records: list[dict[str, object]] = []
+    seen_keys: set[tuple[str, str]] = set()
     for line_number, line in enumerate(raw.splitlines(), start=1):
         if not line:
             fail(f"malformed ledger row at line {line_number}: row is empty")
         try:
             value = json.loads(line)
-            records.append(validate_record(value))
+            record = validate_record(value)
+            key = (str(record["agent"]), str(record["task_id"]))
+            if key in seen_keys:
+                fail("duplicate agent/task key")
+            seen_keys.add(key)
+            records.append(record)
         except (json.JSONDecodeError, GradeError) as exc:
             fail(f"malformed ledger row at line {line_number}: {exc}")
     return records
+
+
+@contextmanager
+def record_lock(path: Path):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.with_name(f".{path.name}.lock").open("a", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            yield
+    except GradeError:
+        raise
+    except OSError as exc:
+        fail(f"could not lock grade ledger: {exc}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -210,29 +231,29 @@ def record_outcome(path: Path, args: argparse.Namespace) -> None:
         fail("false-positive labels must not contain duplicates")
     validate_note(args.note)
 
-    records = load_records(path)
-    if any(row["agent"] == args.agent and row["task_id"] == args.task_id for row in records):
-        fail(f"grade already exists for agent={args.agent} task_id={args.task_id}")
+    with record_lock(path):
+        records = load_records(path)
+        if any(row["agent"] == args.agent and row["task_id"] == args.task_id for row in records):
+            fail(f"grade already exists for agent={args.agent} task_id={args.task_id}")
 
-    row: dict[str, object] = {
-        "agent": args.agent,
-        "task_id": args.task_id,
-        "pr_url": args.pr_url,
-        "outcome": args.outcome,
-        "false_positive_labels": labels,
-        "timestamp": datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "note": args.note,
-    }
-    validate_record(row)
-    serialized = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with path.open("a", encoding="utf-8") as ledger:
-            ledger.write(serialized + "\n")
-            ledger.flush()
-            os.fsync(ledger.fileno())
-    except OSError as exc:
-        fail(f"could not append ledger record: {exc}")
+        row: dict[str, object] = {
+            "agent": args.agent,
+            "task_id": args.task_id,
+            "pr_url": args.pr_url,
+            "outcome": args.outcome,
+            "false_positive_labels": labels,
+            "timestamp": datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "note": args.note,
+        }
+        validate_record(row)
+        serialized = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+        try:
+            with path.open("a", encoding="utf-8") as ledger:
+                ledger.write(serialized + "\n")
+                ledger.flush()
+                os.fsync(ledger.fileno())
+        except OSError as exc:
+            fail(f"could not append ledger record: {exc}")
     print(f"recorded: {args.agent} {args.task_id} {args.outcome}")
 
 
