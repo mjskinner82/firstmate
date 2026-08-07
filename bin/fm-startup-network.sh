@@ -18,10 +18,11 @@
 # owner of every one of these sweeps and still runs all of them, unchanged, via
 # its FM_BOOTSTRAP_NETWORK=only phase. Deferral changes WHEN they run, not
 # WHETHER, and three properties make the later run safe:
-#   - The sweeps and feedback intake are idempotent DETECTORS. A run whose report is lost (killed
-#     worker, truncated digest, crashed session) loses no finding: the next run
-#     re-derives the same dead secondmate, the same stuck clone, the same
-#     undelivered handoff. There is no once-only signal to miss.
+#   - The sweeps are idempotent, and feedback intake's local review recording is
+#     idempotent. A run whose report is lost (killed worker, truncated digest,
+#     crashed session) loses no finding: the next run re-derives the same dead
+#     secondmate, stuck clone, undelivered handoff, and still-pending actionable
+#     feedback. Valid empty and fully stale feedback has no finding to preserve.
 #   - The result is durable and always surfaces. It lands in
 #     state/.startup-network.report and reaches the agent either inline in the
 #     digest or as a `check: startup-network` wake. Only a durable acknowledgement

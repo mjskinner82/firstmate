@@ -19,6 +19,8 @@
 # Local state:
 #   state/github-feedback-reviewed-dates  one successfully handled YYYY-MM-DD per line
 #   state/github-feedback-pending-dates   exact dates in the current actionable output
+# The --read-only mode performs the same retrieval and relevance checks without
+# changing either local record.
 #
 # Usage:
 #   fm-github-feedback-intake.sh [--read-only]
@@ -59,9 +61,13 @@ Fetch every unreviewed retained GitHub feedback date, recheck live candidates
 against current GitHub state, and print only dispatchable work or a visible
 source failure. The command never writes to GitHub or the producer ledger.
 
+Use `--read-only` to perform the same checks without changing local review
+records.
+
 Run `acknowledge` only after every item in the latest actionable output has
 been dispatched, deferred, found already under way, or escalated for a captain
-decision. Valid empty and fully stale dates are recorded automatically.
+decision. In the default mode, valid empty and fully stale dates are recorded
+automatically.
 EOF
 }
 
