@@ -326,14 +326,14 @@ reference_parts() {
 }
 
 assess_pull_request() {
-  local owner=$1 repo=$2 number=$3 ids=$4 card=$5 key cache header kind state merged thread_more check_more
+  local owner=$1 repo=$2 number=$3 ids=$4 card=$5 key cache header kind state merged
   local id row resolved status conclusion stable_name live=0 uncertain=0 evidence_count=0
   key=$(cache_key "pull/$owner/$repo/$number")
   cache="$TMP/cache-$key"
   query_pull_request "$owner" "$repo" "$number" "$cache" || { printf 'error\n'; return; }
   header=$(sed -n '1p' "$cache")
   [ "$header" != MISSING ] || { printf 'stale\n'; return; }
-  IFS="$(printf '\t')" read -r kind state merged thread_more check_more <<EOF
+  IFS="$(printf '\t')" read -r kind state merged _ <<EOF
 $header
 EOF
   [ "${kind:-}" = PR ] || { printf 'error\n'; return; }
