@@ -172,25 +172,15 @@ esac
 
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+# shellcheck source=bin/fm-path-lib.sh
+. "$SCRIPT_DIR/fm-path-lib.sh"
 
-resolve_directory_input() {
-  local name=$1 path=$2 resolved
-  case "$path" in
-    /*) printf '%s\n' "$path"; return 0 ;;
-  esac
-  resolved=$(CDPATH='' cd -- "$path" 2>/dev/null && pwd -P) || {
-    echo "error: $name directory cannot be resolved: $path" >&2
-    return 1
-  }
-  printf '%s\n' "$resolved"
-}
-
-FM_HOME=$(resolve_directory_input FM_HOME "$FM_HOME") || exit 1
+FM_HOME=$(fm_resolve_directory_input FM_HOME "$FM_HOME") || exit 1
 if [ -n "${FM_STATE_OVERRIDE:-}" ]; then
-  FM_STATE_OVERRIDE=$(resolve_directory_input FM_STATE_OVERRIDE "$FM_STATE_OVERRIDE") || exit 1
+  FM_STATE_OVERRIDE=$(fm_resolve_directory_input FM_STATE_OVERRIDE "$FM_STATE_OVERRIDE") || exit 1
 fi
 if [ -n "${FM_DATA_OVERRIDE:-}" ]; then
-  FM_DATA_OVERRIDE=$(resolve_directory_input FM_DATA_OVERRIDE "$FM_DATA_OVERRIDE") || exit 1
+  FM_DATA_OVERRIDE=$(fm_resolve_directory_input FM_DATA_OVERRIDE "$FM_DATA_OVERRIDE") || exit 1
 fi
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
@@ -1113,8 +1103,8 @@ effort_flag_for_harness() {
 case "$LAUNCH" in
   *__MUSEBIN__*)
     MUSE_BIN=$(resolve_muse_binary) || exit 1
-    MUSE_CONFIG_HOME=$(resolve_directory_input XDG_CONFIG_HOME "${XDG_CONFIG_HOME:-${HOME:-}/.config}") || exit 1
-    MUSE_DATA_HOME=$(resolve_directory_input XDG_DATA_HOME "${XDG_DATA_HOME:-${HOME:-}/.local/share}") || exit 1
+    MUSE_CONFIG_HOME=$(fm_resolve_directory_input XDG_CONFIG_HOME "${XDG_CONFIG_HOME:-${HOME:-}/.config}") || exit 1
+    MUSE_DATA_HOME=$(fm_resolve_directory_input XDG_DATA_HOME "${XDG_DATA_HOME:-${HOME:-}/.local/share}") || exit 1
     MUSE_AUTH_FILE="$MUSE_CONFIG_HOME/muse/auth.json"
     if ! muse_credential_present "$MUSE_AUTH_FILE"; then
       if [ -n "${META_API_KEY:-}" ]; then
@@ -1161,17 +1151,6 @@ resolve_project_dir_arg() {
   esac
 }
 
-path_is_ancestor_of() {
-  local ancestor=$1 path=$2
-  [ -n "$ancestor" ] || return 1
-  [ -n "$path" ] || return 1
-  [ "$ancestor" != "$path" ] || return 1
-  case "$path" in
-    "$ancestor"/*) return 0 ;;
-  esac
-  return 1
-}
-
 validate_firstmate_home_for_spawn() {
   local id=$1 home=$2 abs_home abs_active_home abs_root marker_id
   abs_home=$(resolved_existing_dir "$home") || return 1
@@ -1189,19 +1168,19 @@ validate_firstmate_home_for_spawn() {
     echo "error: secondmate home cannot be the firstmate repo: $home" >&2
     return 1
   fi
-  if path_is_ancestor_of "$abs_active_home" "$abs_home"; then
+  if fm_path_is_strict_descendant "$abs_active_home" "$abs_home"; then
     echo "error: secondmate home cannot be inside the active firstmate home: $home" >&2
     return 1
   fi
-  if path_is_ancestor_of "$abs_root" "$abs_home"; then
+  if fm_path_is_strict_descendant "$abs_root" "$abs_home"; then
     echo "error: secondmate home cannot be inside the firstmate repo: $home" >&2
     return 1
   fi
-  if path_is_ancestor_of "$abs_home" "$abs_active_home"; then
+  if fm_path_is_strict_descendant "$abs_home" "$abs_active_home"; then
     echo "error: secondmate home cannot be an ancestor of the active firstmate home: $home" >&2
     return 1
   fi
-  if path_is_ancestor_of "$abs_home" "$abs_root"; then
+  if fm_path_is_strict_descendant "$abs_home" "$abs_root"; then
     echo "error: secondmate home cannot be an ancestor of the firstmate repo: $home" >&2
     return 1
   fi
@@ -1242,15 +1221,15 @@ validate_firstmate_operational_dirs() {
     else
       abs_dir="$abs_home/$name"
     fi
-    if ! path_is_ancestor_of "$abs_home" "$abs_dir"; then
+    if ! fm_path_is_strict_descendant "$abs_home" "$abs_dir"; then
       echo "error: secondmate $name directory must resolve inside the secondmate home: $dir" >&2
       return 1
     fi
-    if [ "$abs_dir" = "$abs_active_home" ] || path_is_ancestor_of "$abs_active_home" "$abs_dir"; then
+    if [ "$abs_dir" = "$abs_active_home" ] || fm_path_is_strict_descendant "$abs_active_home" "$abs_dir"; then
       echo "error: secondmate $name directory cannot be inside the active firstmate home: $dir" >&2
       return 1
     fi
-    if [ "$abs_dir" = "$abs_root" ] || path_is_ancestor_of "$abs_root" "$abs_dir"; then
+    if [ "$abs_dir" = "$abs_root" ] || fm_path_is_strict_descendant "$abs_root" "$abs_dir"; then
       echo "error: secondmate $name directory cannot be inside the firstmate repo: $dir" >&2
       return 1
     fi
