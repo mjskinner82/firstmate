@@ -35,6 +35,8 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 # shellcheck source=bin/fm-lock-lib.sh
 . "$SCRIPT_DIR/fm-lock-lib.sh"
+# shellcheck source=bin/fm-git-lib.sh
+. "$SCRIPT_DIR/fm-git-lib.sh"
 FM_LOCK_LOG_PREFIX=fleet-sync
 "$FM_ROOT/bin/fm-guard.sh" || true
 
@@ -105,22 +107,6 @@ resolve_project_arg() {
       ;;
   esac
   printf '%s\n' "$arg"
-}
-
-default_branch() {
-  local ref branch
-  ref=$(git -C "$PROJ" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
-  if [ -n "$ref" ]; then
-    echo "${ref#origin/}"
-    return 0
-  fi
-  for branch in main master; do
-    if git -C "$PROJ" show-ref --verify --quiet "refs/heads/$branch"; then
-      echo "$branch"
-      return 0
-    fi
-  done
-  return 1
 }
 
 first_line() {
@@ -323,7 +309,7 @@ sync_project() {
 
   prune_gone_branches || true
 
-  DEFAULT=$(default_branch) || {
+  DEFAULT=$(fm_default_branch "$PROJ") || {
     echo "$label: skipped: cannot determine default branch"
     return 0
   }
