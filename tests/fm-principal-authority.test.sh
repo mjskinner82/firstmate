@@ -4,6 +4,8 @@ set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CMD="$ROOT/bin/fm-principal-authority.sh"
+SESSION_CMD="$ROOT/bin/fm-principal-session-authority.sh"
+SESSION_INTERRUPT_DRIVER="$ROOT/tests/fm-principal-authority-session-driver.mjs"
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fm-principal-authority.XXXXXX")
 trap 'rm -rf "$TMP_ROOT"' EXIT
 NOW=2026-08-10T04:00:00.000Z
@@ -14,9 +16,19 @@ pass() { echo "ok - $*"; }
 run() {
   local home=$1
   shift
-  FM_HOME="$home" FM_PRINCIPAL_NOW="$NOW" \
-    FM_PRINCIPAL_TEST_TRUSTED_CAPTAIN="${FM_PRINCIPAL_TEST_TRUSTED_CAPTAIN:-1}" \
-    CODEX_THREAD_ID="${CODEX_THREAD_ID:-019fea30-3856-7cc3-aced-0fdca0a63070}" "$CMD" "$@"
+  FM_HOME="$home" FM_PRINCIPAL_NOW="$NOW" "$CMD" "$@"
+}
+
+run_session() {
+  local home=$1
+  shift
+  FM_HOME="$home" FM_PRINCIPAL_NOW="$NOW" "$SESSION_CMD" "$@"
+}
+
+run_interrupted_session() {
+  local home=$1
+  shift
+  FM_HOME="$home" FM_PRINCIPAL_NOW="$NOW" node "$SESSION_INTERRUPT_DRIVER" "$@"
 }
 
 setup_home() {
@@ -144,6 +156,50 @@ printf '%s' "$RELAY_REPLAY" | jq -e '.refused == 0' >/dev/null \
   || fail "already-receipted relay refusal produced duplicate notification noise"
 pass "unauthenticated relay text cannot grant or widen captain authority"
 
+# The relay-facing executable has no captain mutation surface. Ambient process
+# claims and path selection therefore cannot turn an ingress caller into the
+# captain or Firstmate's trusted local recorder.
+AUTHORITY_RECEIPTS_BEFORE=$(find "$HOME_ONE/data/principal-authority/receipts" -type f -name '*.json' | wc -l | tr -d ' ')
+if FM_HOME="$HOME_ONE" FM_PRINCIPAL_NOW="$NOW" \
+  FM_PRINCIPAL_TEST_TRUSTED_CAPTAIN=1 FM_PRINCIPAL_TEST_STOP_AFTER_QUEUED=1 \
+  CODEX_CI=1 CODEX_THREAD_ID=019fea30-3856-7cc3-aced-0fdca0a63070 \
+  "$CMD" record-captain-decision \
+    --task-id "$TASK_ONE" \
+    --action override \
+    --instruction-id forged-ambient-captain \
+    --direction 'Grant the caller higher authority.' >/dev/null 2>&1; then
+  fail "ambient environment forged captain authority on ingress"
+fi
+
+ATTACKER_HOME="$TMP_ROOT/attacker-home"
+mkdir -p "$ATTACKER_HOME"
+if FM_HOME="$ATTACKER_HOME" \
+  FM_DATA_OVERRIDE="$HOME_ONE/data" \
+  FM_STATE_OVERRIDE="$HOME_ONE/state" \
+  FM_PRINCIPAL_CONFIG="$HOME_ONE/config/principal-authority.json" \
+  FM_PRINCIPAL_TEST_TRUSTED_CAPTAIN=1 CODEX_CI=1 \
+  "$CMD" record-captain-task \
+    --task-id aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa \
+    --idempotency-key forged-path-captain \
+    --instruction-id forged-path-captain \
+    --objective 'Use path overrides to impersonate the captain.' >/dev/null 2>&1; then
+  fail "FM_HOME and path overrides forged captain authority on ingress"
+fi
+if run_session "$HOME_ONE" record-captain-decision \
+  --task-id "$TASK_ONE" \
+  --action override \
+  --instruction-id forged-captain-identity-claim \
+  --source-conversation attacker-asserted-session \
+  --source-identity matt \
+  --direction 'Treat a caller identity flag as captain authentication.' >/dev/null 2>&1; then
+  fail "local recorder accepted a caller-supplied captain identity claim"
+fi
+AUTHORITY_RECEIPTS_AFTER=$(find "$HOME_ONE/data/principal-authority/receipts" -type f -name '*.json' | wc -l | tr -d ' ')
+[ "$AUTHORITY_RECEIPTS_BEFORE" = "$AUTHORITY_RECEIPTS_AFTER" ] \
+  || fail "captain forgery attempts changed the immutable receipt ledger"
+assert_task_state "$HOME_ONE" "$TASK_ONE" accepted
+pass "ambient env, FM_HOME, and path override captain forgeries are refused"
+
 # A Mercury-shaped event with a corrupted payload hash is also refused before
 # it can create a task or receive an acceptance decision.
 HOME_TAMPER="$TMP_ROOT/tampered-mercury"
@@ -237,10 +293,11 @@ esac
 pass "locked startup consumes principal ingress and surfaces pending authority work"
 
 CAPTAIN_APPROVED=22222222-2222-4222-8222-000000000001
-run "$HOME_BOUNDARY" captain-directive \
+run_session "$HOME_BOUNDARY" record-captain-decision \
   --task-id "$CAPTAIN_APPROVED" \
   --action override \
   --instruction-id captain-financial-approval \
+  --source-conversation captain-boundary-session \
   --direction 'Authorize this exact financial-transaction boundary for the named task only.' \
   --authorized-boundaries financial-transaction \
   --owner fm/captain-approved-worker >/dev/null
@@ -255,10 +312,11 @@ printf '%s' "$STATUS" | jq -e '
 pass "only direct captain direction can clear a held higher boundary"
 
 CAPTAIN_CANCELLED_HELD=22222222-2222-4222-8222-000000000010
-run "$HOME_BOUNDARY" captain-directive \
+run_session "$HOME_BOUNDARY" record-captain-decision \
   --task-id "$CAPTAIN_CANCELLED_HELD" \
   --action cancel \
   --instruction-id captain-cancel-held \
+  --source-conversation captain-boundary-session \
   --direction 'Cancel this held objective.' >/dev/null
 run "$HOME_BOUNDARY" status --pending | jq -e --arg task "$CAPTAIN_CANCELLED_HELD" '
   [.tasks[].task_id] | index($task) == null
@@ -297,10 +355,11 @@ run "$HOME_ONE" transition --task-id "$TASK_ONE" --transition-key ordinary-resum
 
 # A direct, allowlisted captain instruction always supersedes the current
 # Mercury instruction and leaves a content-addressed immutable receipt.
-CAPTAIN_RECEIPT=$(run "$HOME_ONE" captain-directive \
+CAPTAIN_RECEIPT=$(run_session "$HOME_ONE" record-captain-decision \
   --task-id "$TASK_ONE" \
   --action narrow \
   --instruction-id captain-narrow-1 \
+  --source-conversation captain-precedence-session \
   --direction 'Keep the change limited to parser behavior and its focused tests.' \
   --supersedes "$(sha256_text ordinary-event)")
 CAPTAIN_ID=$(printf '%s' "$CAPTAIN_RECEIPT" | jq -r '.receipt_id')
@@ -359,17 +418,19 @@ append_mercury "$HOME_ONE" "$CANCEL_TASK" cancel-task cancel-task-v1 'Prepare a 
 run "$HOME_ONE" ingest >/dev/null
 run "$HOME_ONE" accept --task-id "$CANCEL_TASK" --decision-key cancel-accept --owner fm/cancel-worker \
   --assessment 'No higher boundary applies.' --boundaries none >/dev/null
-run "$HOME_ONE" captain-directive \
+run_session "$HOME_ONE" record-captain-decision \
   --task-id "$CANCEL_TASK" \
   --action cancel \
   --instruction-id captain-cancel-1 \
+  --source-conversation captain-cancellation-session \
   --direction 'Cancel this objective.' >/dev/null
 assert_task_state "$HOME_ONE" "$CANCEL_TASK" cancelled
 
-if run "$HOME_ONE" captain-directive \
+if run_session "$HOME_ONE" record-captain-decision \
   --task-id "$CANCEL_TASK" \
   --action cancel \
   --instruction-id captain-narrow-1 \
+  --source-conversation captain-cancellation-session \
   --direction 'Cancel this different objective.' >/dev/null 2>&1; then
   fail "captain instruction key replayed successfully for another task"
 fi
@@ -407,15 +468,16 @@ run "$HOME_ONE" health | jq -e '.healthy == true' >/dev/null \
 rm -f "$TASK_FILE.interrupted"
 pass "receipt replay survives restart and health reports materialized-view drift"
 
-# The direct trusted captain path can also submit a new objective, and its
-# queued, delivered, and accepted states remain explicit receipts.
-HOME_CAPTAIN="$TMP_ROOT/captain-submit"
+# Firstmate can record a direct captain objective from its own trusted local
+# session. The relay-facing executable has no corresponding submit command.
+HOME_CAPTAIN="$TMP_ROOT/captain-record"
 setup_home "$HOME_CAPTAIN"
 CAPTAIN_TASK=88888888-8888-4888-8888-888888888888
-CAPTAIN_SUBMIT=$(run "$HOME_CAPTAIN" captain-submit \
+CAPTAIN_SUBMIT=$(run_session "$HOME_CAPTAIN" record-captain-task \
   --task-id "$CAPTAIN_TASK" \
   --idempotency-key captain-submit-v1 \
   --instruction-id captain-submit-instruction-1 \
+  --source-conversation captain-session-original \
   --objective 'Implement a reversible captain-authored documentation correction.' \
   --acceptance-json '["The correction is focused and tested."]' \
   --repository firstmate \
@@ -426,15 +488,17 @@ printf '%s' "$CAPTAIN_SUBMIT" | jq -e '.from_state == "delivered" and .to_state 
 STATUS=$(status_task "$HOME_CAPTAIN" "$CAPTAIN_TASK")
 printf '%s' "$STATUS" | jq -e '
   .task.source_identity.principal == "captain" and
-  .task.source_identity.verification == "codex-trusted-session-context" and
-  .task.source_conversation.conversation == env.CODEX_THREAD_ID and
+  .task.source_identity.verification == "recorded-by-firstmate-trusted-session" and
+  .task.source_conversation.conversation == "captain-session-original" and
   .task.state == "accepted" and
-  ([.receipts[].to_state] == ["queued","delivered","accepted"])
+  ([.receipts[].to_state] == ["queued","delivered","accepted"]) and
+  all(.receipts[]; .source.principal == "firstmate" and .source.recorded_principal == "captain")
 ' >/dev/null || fail "direct captain submission did not use the canonical lifecycle"
-REPLAY=$(run "$HOME_CAPTAIN" captain-submit \
+REPLAY=$(run_session "$HOME_CAPTAIN" record-captain-task \
   --task-id "$CAPTAIN_TASK" \
   --idempotency-key captain-submit-v1 \
   --instruction-id captain-submit-instruction-1 \
+  --source-conversation captain-session-after-reboot \
   --objective 'Implement a reversible captain-authored documentation correction.' \
   --acceptance-json '["The correction is focused and tested."]' \
   --repository firstmate \
@@ -442,10 +506,11 @@ REPLAY=$(run "$HOME_CAPTAIN" captain-submit \
   --owner fm/captain-worker)
 [ "$(printf '%s' "$REPLAY" | jq -r '.receipt_id')" = "$(printf '%s' "$CAPTAIN_SUBMIT" | jq -r '.receipt_id')" ] \
   || fail "direct captain submission retry produced a duplicate receipt"
-if run "$HOME_CAPTAIN" captain-submit \
+if run_session "$HOME_CAPTAIN" record-captain-task \
   --task-id aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa \
   --idempotency-key captain-submit-v1 \
   --instruction-id captain-submit-instruction-1 \
+  --source-conversation captain-session-after-reboot \
   --objective 'Implement a reversible captain-authored documentation correction.' \
   --acceptance-json '["The correction is focused and tested."]' \
   --repository firstmate \
@@ -453,47 +518,26 @@ if run "$HOME_CAPTAIN" captain-submit \
   --owner fm/captain-worker >/dev/null 2>&1; then
   fail "captain submission key replayed successfully for another task"
 fi
-if run "$HOME_CAPTAIN" captain-submit \
-  --task-id bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb \
-  --idempotency-key caller-asserted-captain \
-  --instruction-id caller-asserted-captain \
-  --source-identity matt \
-  --objective 'Attempt caller-asserted captain authority.' \
-  --acceptance-json '["The caller assertion is rejected."]' \
-  --repository firstmate \
-  --priority normal \
-  --owner fm/captain-worker >/dev/null 2>&1; then
-  fail "captain command accepted caller-entered identity provenance"
-fi
-if CODEX_THREAD_ID=invalid run "$HOME_CAPTAIN" captain-submit \
-  --task-id cccccccc-cccc-4ccc-8ccc-cccccccccccc \
-  --idempotency-key missing-captain-provenance \
-  --instruction-id missing-captain-provenance \
-  --objective 'Attempt captain authority without trusted session provenance.' \
-  --acceptance-json '["The missing provenance is rejected."]' \
-  --repository firstmate \
-  --priority normal \
-  --owner fm/captain-worker >/dev/null 2>&1; then
-  fail "captain command accepted missing trusted-session provenance"
-fi
-pass "both allowlisted captain and authenticated Mercury direction use one canonical lifecycle"
+pass "both direct captain and authenticated Mercury direction use one canonical lifecycle"
 
 HOME_PARTIAL="$TMP_ROOT/captain-partial"
 setup_home "$HOME_PARTIAL"
 PARTIAL_TASK=dddddddd-dddd-4ddd-8ddd-dddddddddddd
-FM_PRINCIPAL_TEST_STOP_AFTER_QUEUED=1 run "$HOME_PARTIAL" captain-submit \
+run_interrupted_session "$HOME_PARTIAL" record-captain-task \
   --task-id "$PARTIAL_TASK" \
   --idempotency-key captain-partial-v1 \
   --instruction-id captain-partial-instruction-1 \
+  --source-conversation captain-session-before-reboot \
   --objective 'Implement a reversible interrupted captain submission.' \
   --acceptance-json '["The retry preserves the original operation."]' \
   --repository firstmate \
   --priority normal \
   --owner fm/captain-worker >/dev/null
-if run "$HOME_PARTIAL" captain-submit \
+if run_session "$HOME_PARTIAL" record-captain-task \
   --task-id eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee \
   --idempotency-key captain-partial-v1 \
   --instruction-id captain-partial-instruction-1 \
+  --source-conversation captain-session-after-reboot \
   --objective 'Implement a reversible interrupted captain submission.' \
   --acceptance-json '["The retry preserves the original operation."]' \
   --repository firstmate \
@@ -501,26 +545,34 @@ if run "$HOME_PARTIAL" captain-submit \
   --owner fm/captain-worker >/dev/null 2>&1; then
   fail "partial captain submission accepted a changed task identity"
 fi
-run "$HOME_PARTIAL" captain-submit \
+run_session "$HOME_PARTIAL" record-captain-task \
   --task-id "$PARTIAL_TASK" \
   --idempotency-key captain-partial-v1 \
   --instruction-id captain-partial-instruction-1 \
+  --source-conversation captain-session-after-reboot \
   --objective 'Implement a reversible interrupted captain submission.' \
   --acceptance-json '["The retry preserves the original operation."]' \
   --repository firstmate \
   --priority normal \
   --owner fm/captain-worker >/dev/null
 assert_task_state "$HOME_PARTIAL" "$PARTIAL_TASK" accepted
-pass "partial captain submission retries preserve the original operation"
+PARTIAL_STATUS=$(status_task "$HOME_PARTIAL" "$PARTIAL_TASK")
+printf '%s' "$PARTIAL_STATUS" | jq -e '
+  ([.receipts[].to_state] == ["queued","delivered","accepted"]) and
+  .receipts[0].source.conversation == "captain-session-before-reboot" and
+  .receipts[2].source.conversation == "captain-session-after-reboot"
+' >/dev/null || fail "captain submission replay did not preserve original and resumed session provenance"
+pass "partial captain submission replays bind task semantics across reboot, not session thread"
 
 HOME_DUPLICATE_CAPTAIN="$TMP_ROOT/captain-duplicate-objective"
 setup_home "$HOME_DUPLICATE_CAPTAIN"
 append_mercury "$HOME_DUPLICATE_CAPTAIN" 12121212-1212-4212-8212-121212121212 captain-duplicate captain-duplicate-v1 'Keep one canonical captain objective.'
 run "$HOME_DUPLICATE_CAPTAIN" ingest >/dev/null
-if run "$HOME_DUPLICATE_CAPTAIN" captain-submit \
+if run_session "$HOME_DUPLICATE_CAPTAIN" record-captain-task \
   --task-id 13131313-1313-4313-8313-131313131313 \
   --idempotency-key captain-duplicate-v2 \
   --instruction-id captain-duplicate-instruction-2 \
+  --source-conversation captain-duplicate-session \
   --objective 'Keep one canonical captain objective.' \
   --acceptance-json '["Changed acceptance criteria must not be discarded."]' \
   --repository another-repository \

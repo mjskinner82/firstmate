@@ -8,17 +8,16 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
-  realpathSync,
   renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { execFileSync, spawnSync } from "node:child_process";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
+const MODULE_PATH = fileURLToPath(import.meta.url);
+const SCRIPT_DIR = dirname(MODULE_PATH);
 const ROOT = resolve(SCRIPT_DIR, "..");
 const HOME = process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE || ROOT;
 const DATA = process.env.FM_DATA_OVERRIDE || join(HOME, "data");
@@ -76,8 +75,8 @@ const MERCURY_EVENT_KEYS = new Set([
   "task_id",
 ]);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const CODEX_THREAD_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SHA256_RE = /^[0-9a-f]{64}$/;
+let runtimeHooks = Object.freeze({});
 
 class AuthorityError extends Error {
   constructor(code, message) {
@@ -273,8 +272,8 @@ function readConfig() {
   const config = readJson(CONFIG_PATH, "principal authority config");
   exactKeys(config, new Set(["schema", "captain_sources", "mercury_sources"]), "principal authority config");
   if (config.schema !== CONFIG_SCHEMA) fail("schema_drift", `principal authority config schema must be ${CONFIG_SCHEMA}`);
-  if (!Array.isArray(config.captain_sources) || config.captain_sources.length < 1 || config.captain_sources.length > 20) {
-    fail("invalid_config", "captain_sources must contain 1 to 20 entries");
+  if (!Array.isArray(config.captain_sources) || config.captain_sources.length !== 1) {
+    fail("invalid_config", "captain_sources must contain exactly one descriptive trusted-session principal");
   }
   if (!Array.isArray(config.mercury_sources) || config.mercury_sources.length < 1 || config.mercury_sources.length > 20) {
     fail("invalid_config", "mercury_sources must contain 1 to 20 entries");
@@ -294,11 +293,6 @@ function readConfig() {
     };
   });
   return config;
-}
-
-function validateCaptainSource(config, identity, channel) {
-  const match = config.captain_sources.some((source) => source.identity === identity && source.channel === channel);
-  if (!match) fail("captain_identity_rejected", "captain identity and trusted channel are not allowlisted together");
 }
 
 function validateMercurySource(config, identity, keyId) {
@@ -967,102 +961,46 @@ function commandTransition(flags) {
   process.stdout.write(`${asciiJson(publicReceipt(receipt), true)}\n`);
 }
 
-function pathIsWithin(root, candidate) {
-  const path = relative(root, candidate);
-  return path === "" || (!path.startsWith("..") && !isAbsolute(path));
-}
-
-function isolatedCaptainTestMode() {
-  if (process.env.FM_PRINCIPAL_TEST_TRUSTED_CAPTAIN !== "1") return false;
-  const root = realpathSync(ROOT);
-  const home = realpathSync(HOME);
-  const data = realpathSync(DATA);
-  const state = realpathSync(STATE);
-  const configDirectory = realpathSync(dirname(CONFIG_PATH));
-  if (home === root || !pathIsWithin(home, data) || !pathIsWithin(home, state) || !pathIsWithin(home, configDirectory)) {
-    fail("captain_identity_rejected", "test captain provenance is restricted to an isolated non-production home");
-  }
-  return true;
-}
-
-function signedCodexAncestor(threadId) {
-  if (process.platform !== "darwin") return null;
-  let pid = process.ppid;
-  for (let depth = 0; depth < 12 && pid > 1; depth += 1) {
-    let parent;
-    let executable;
-    try {
-      parent = Number.parseInt(execFileSync("/bin/ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8" }).trim(), 10);
-      executable = execFileSync("/bin/ps", ["-o", "comm=", "-p", String(pid)], { encoding: "utf8" }).trim();
-    } catch {
-      return null;
-    }
-    if (basename(executable) === "codex") {
-      let argumentsText;
-      let signature;
-      try {
-        const canonicalExecutable = realpathSync(executable);
-        const verification = spawnSync("/usr/bin/codesign", ["--verify", "--strict", canonicalExecutable], {
-          encoding: "utf8",
-        });
-        if (verification.status !== 0) return null;
-        const details = spawnSync("/usr/bin/codesign", ["-dv", "--verbose=4", canonicalExecutable], {
-          encoding: "utf8",
-        });
-        if (details.status !== 0) return null;
-        signature = `${details.stdout || ""}${details.stderr || ""}`;
-        argumentsText = execFileSync("/bin/ps", ["-ww", "-o", "args=", "-p", String(pid)], { encoding: "utf8" });
-      } catch {
-        return null;
-      }
-      if (
-        signature.includes("Identifier=codex") &&
-        signature.includes("TeamIdentifier=2DC432GLL2") &&
-        signature.includes("Authority=Developer ID Application: OpenAI OpCo, LLC (2DC432GLL2)") &&
-        argumentsText.includes(threadId)
-      ) {
-        return executable;
-      }
-      return null;
-    }
-    if (!Number.isInteger(parent) || parent < 1 || parent === pid) return null;
-    pid = parent;
-  }
-  return null;
-}
-
-function captainSource(config) {
-  const conversation = process.env.CODEX_THREAD_ID;
-  if (!CODEX_THREAD_RE.test(conversation || "")) {
-    fail("captain_identity_rejected", "captain commands require provenance from an active trusted Codex session");
-  }
-  const testMode = isolatedCaptainTestMode();
-  if (!testMode && !signedCodexAncestor(conversation)) {
-    fail("captain_identity_rejected", "captain commands require a code-signed OpenAI Codex session ancestor");
-  }
-  const matches = config.captain_sources.filter((source) => source.channel === "codex");
-  if (matches.length !== 1) fail("captain_identity_rejected", "the trusted Codex boundary must map to exactly one captain identity");
-  const [{ identity, channel }] = matches;
-  validateCaptainSource(config, identity, channel);
+function recordedCaptainSource(config, conversation, message) {
+  const [{ identity, channel }] = config.captain_sources;
   return {
     principal: "captain",
     identity,
     identity_key_id: null,
     identity_verified: true,
-    verification: "codex-trusted-session-context",
+    verification: "recorded-by-firstmate-trusted-session",
     channel,
     conversation,
-    message: null,
+    message,
   };
 }
 
-function commandCaptainSubmit(flags) {
+function firstmateRecorderSource(captainSource, instructionId) {
+  return {
+    principal: "firstmate",
+    identity: "firstmate",
+    identity_key_id: null,
+    identity_verified: true,
+    verification: "local-firstmate-session-recorder",
+    channel: "local",
+    conversation: captainSource.conversation,
+    message: captainSource.message,
+    instruction_id: instructionId,
+    recorded_principal: "captain",
+    recorded_identity: captainSource.identity,
+    recorded_channel: captainSource.channel,
+  };
+}
+
+function commandRecordCaptainTask(flags) {
   rejectUnknownFlags(
     flags,
     new Set([
       "task-id",
       "idempotency-key",
       "instruction-id",
+      "source-conversation",
+      "source-message",
       "objective",
       "acceptance-json",
       "repository",
@@ -1072,9 +1010,13 @@ function commandCaptainSubmit(flags) {
     ]),
   );
   const config = readConfig();
-  const source = captainSource(config);
   const instructionId = requireFlag(flags, "instruction-id", 300);
-  source.instruction_id = instructionId;
+  const sourceConversation = requireFlag(flags, "source-conversation", 500);
+  const sourceMessage = flags["source-message"]
+    ? boundedText(flags["source-message"], "--source-message", 500)
+    : instructionId;
+  const captainSource = recordedCaptainSource(config, sourceConversation, sourceMessage);
+  const recorder = firstmateRecorderSource(captainSource, instructionId);
   const objective = requireFlag(flags, "objective", 12000);
   const event = {
     task_id: flags["task-id"] || randomUUID(),
@@ -1097,15 +1039,15 @@ function commandCaptainSubmit(flags) {
     fail("idempotency_conflict", `assignment idempotency key ${event.idempotency_key} maps to another objective`);
   }
   const operation = {
-    command: "captain-submit",
+    command: "record-captain-task",
     task_id: flags["task-id"] || null,
     instruction_id: instructionId,
-    source,
     event: { ...event, task_id: flags["task-id"] || null },
     owner,
     authorized_boundaries: authorized,
+    captain_identity: captainSource.identity,
   };
-  const replayKey = `captain-submit:${event.idempotency_key}:accepted`;
+  const replayKey = `captain-record-task:${event.idempotency_key}:accepted`;
   const existingReplay = receiptForKey(replayKey, store.receipts);
   const replay = existingReplay
     ? replayForCommand(replayKey, store.receipts, flags["task-id"] || existingReplay.task_id, operation)
@@ -1121,7 +1063,7 @@ function commandCaptainSubmit(flags) {
     existing.effective_instruction.instruction_id === instructionId
   ) {
     const queuedReplay = replayForCommand(
-      `captain-submit:${event.idempotency_key}:queued`,
+      `captain-record-task:${event.idempotency_key}:queued`,
       store.receipts,
       existing.task_id,
       operation,
@@ -1131,17 +1073,18 @@ function commandCaptainSubmit(flags) {
     if (current.state === "queued") {
       current = transitionReceipt(current, {
         to: "delivered",
-        idempotencyKey: `captain-submit:${event.idempotency_key}:delivered`,
-        source: { ...source, instruction_id: instructionId },
-        reason: "The direct captain instruction reached Firstmate.",
+        idempotencyKey: `captain-record-task:${event.idempotency_key}:delivered`,
+        source: recorder,
+        reason: "Firstmate durably recorded the direct captain instruction.",
+        operationHash: hashValue(operation),
       }).task_after;
     }
     if (current.state === "delivered") {
       const accepted = transitionReceipt(current, {
         to: "accepted",
-        idempotencyKey: `captain-submit:${event.idempotency_key}:accepted`,
-        source: { ...source, instruction_id: instructionId },
-        reason: "The direct captain instruction was explicitly accepted.",
+        idempotencyKey: `captain-record-task:${event.idempotency_key}:accepted`,
+        source: recorder,
+        reason: "Firstmate explicitly accepted the directly confirmed captain instruction.",
         authority: { basis: "captain-direct", boundaries: authorized },
         notificationClass: "acceptance",
         operationHash: hashValue(operation),
@@ -1162,9 +1105,10 @@ function commandCaptainSubmit(flags) {
     fail("task_drift", "captain submission is partially recorded in an unsupported lifecycle state");
   }
   if (existing) {
-    fail("duplicate_objective", "objective already has a canonical task; use captain-directive for bounded changes");
+    fail("duplicate_objective", "objective already has a canonical task; record a bounded captain decision instead");
   }
-  const base = makeBaseTask(event, source);
+  const captainTaskSource = { ...captainSource, instruction_id: instructionId };
+  const base = makeBaseTask(event, captainTaskSource);
   const timestamp = now();
   const queued = structuredClone(base);
   queued.revision = 1;
@@ -1173,14 +1117,14 @@ function commandCaptainSubmit(flags) {
   let receipt = applyReceipt({
     schema: RECEIPT_SCHEMA,
     receipt_type: "lifecycle-transition",
-    idempotency_key: `captain-submit:${event.idempotency_key}:queued`,
+    idempotency_key: `captain-record-task:${event.idempotency_key}:queued`,
     task_id: base.task_id,
     objective_hash: base.objective_hash,
     revision: 1,
     from_state: null,
     to_state: "queued",
-    source: { ...source, instruction_id: instructionId },
-    reason: "A direct allowlisted captain instruction entered the durable queue.",
+    source: recorder,
+    reason: "Firstmate recorded a direct captain instruction into the durable queue.",
     authority: { basis: "captain-direct", boundaries: authorized },
     supersedes_instruction_id: null,
     notification_class: "silent",
@@ -1188,22 +1132,22 @@ function commandCaptainSubmit(flags) {
     recorded_at: timestamp,
     task_after: queued,
   });
-  if (isolatedCaptainTestMode() && process.env.FM_PRINCIPAL_TEST_STOP_AFTER_QUEUED === "1") {
+  if (runtimeHooks.afterCaptainTaskQueued?.(publicReceipt(receipt)) === true) {
     process.stdout.write(`${asciiJson(publicReceipt(receipt), true)}\n`);
     return;
   }
   receipt = transitionReceipt(receipt.task_after, {
     to: "delivered",
-    idempotencyKey: `captain-submit:${event.idempotency_key}:delivered`,
-    source: { ...source, instruction_id: instructionId },
-    reason: "The direct captain instruction reached Firstmate.",
+    idempotencyKey: `captain-record-task:${event.idempotency_key}:delivered`,
+    source: recorder,
+    reason: "Firstmate durably recorded the direct captain instruction.",
     operationHash: hashValue(operation),
   });
   receipt = transitionReceipt(receipt.task_after, {
     to: "accepted",
-    idempotencyKey: `captain-submit:${event.idempotency_key}:accepted`,
-    source: { ...source, instruction_id: instructionId },
-    reason: "The direct captain instruction was explicitly accepted.",
+    idempotencyKey: `captain-record-task:${event.idempotency_key}:accepted`,
+    source: recorder,
+    reason: "Firstmate explicitly accepted the directly confirmed captain instruction.",
     authority: { basis: "captain-direct", boundaries: authorized },
     notificationClass: "acceptance",
     operationHash: hashValue(operation),
@@ -1221,13 +1165,15 @@ function commandCaptainSubmit(flags) {
   process.stdout.write(`${asciiJson(publicReceipt(receipt), true)}\n`);
 }
 
-function commandCaptainDirective(flags) {
+function commandRecordCaptainDecision(flags) {
   rejectUnknownFlags(
     flags,
     new Set([
       "task-id",
       "action",
       "instruction-id",
+      "source-conversation",
+      "source-message",
       "direction",
       "supersedes",
       "authorized-boundaries",
@@ -1235,28 +1181,33 @@ function commandCaptainDirective(flags) {
     ]),
   );
   const config = readConfig();
-  const source = captainSource(config);
   const taskId = requireFlag(flags, "task-id", 100);
   const action = requireFlag(flags, "action", 50);
   if (!["pause", "override", "narrow", "cancel"].includes(action)) fail("invalid_input", "captain action must be pause, override, narrow, or cancel");
   const instructionId = requireFlag(flags, "instruction-id", 300);
+  const sourceConversation = requireFlag(flags, "source-conversation", 500);
+  const sourceMessage = flags["source-message"]
+    ? boundedText(flags["source-message"], "--source-message", 500)
+    : instructionId;
+  const captainSource = recordedCaptainSource(config, sourceConversation, sourceMessage);
+  const recorder = firstmateRecorderSource(captainSource, instructionId);
   const direction = requireFlag(flags, "direction", 12000);
   const authorized = parseBoundaries(flags["authorized-boundaries"] || "none", { allowNone: true });
   const suppliedSupersedes = flags.supersedes ? boundedText(flags.supersedes, "--supersedes", 300) : null;
   const owner = flags.owner ? boundedText(flags.owner, "--owner", 500) : null;
   const store = recoverStore({ repair: false });
   const operation = {
-    command: "captain-directive",
+    command: "record-captain-decision",
     task_id: taskId,
     action,
     instruction_id: instructionId,
-    source,
     direction,
     supersedes: suppliedSupersedes,
     authorized_boundaries: authorized,
     owner,
+    captain_identity: captainSource.identity,
   };
-  const replay = replayForCommand(`captain-directive:${instructionId}`, store.receipts, taskId, operation);
+  const replay = replayForCommand(`captain-record-decision:${instructionId}`, store.receipts, taskId, operation);
   if (replay) {
     process.stdout.write(`${asciiJson(publicReceipt(replay), true)}\n`);
     return;
@@ -1286,8 +1237,8 @@ function commandCaptainDirective(flags) {
   const receipt = transitionReceipt(task, {
     to,
     receiptType: "captain-directive",
-    idempotencyKey: `captain-directive:${instructionId}`,
-    source: { ...source, instruction_id: instructionId },
+    idempotencyKey: `captain-record-decision:${instructionId}`,
+    source: recorder,
     reason: direction,
     authority: { basis: "captain-direct", boundaries: authorized, action },
     supersedesInstructionId: supersedes,
@@ -1299,8 +1250,8 @@ function commandCaptainDirective(flags) {
         principal: "captain",
         action,
         direction,
-        source_channel: source.channel,
-        source_conversation: source.conversation,
+        source_channel: captainSource.channel,
+        source_conversation: captainSource.conversation,
       };
       if (owner) next.owner = owner;
       if (action === "pause") {
@@ -1414,31 +1365,55 @@ function commandRecover(flags) {
   process.stdout.write(`${asciiJson({ schema: STATUS_SCHEMA, recovered: true, tasks: store.tasks.size, receipts: store.receipts.length })}\n`);
 }
 
-function printHelp() {
+function printIngressHelp() {
   process.stdout.write(`fm-principal-authority.sh commands:\n\n`);
   process.stdout.write(`  ingest [--events <jsonl>]\n`);
   process.stdout.write(`  accept --task-id <uuid> --decision-key <key> --owner <owner> --assessment <reason> --boundaries none\n`);
   process.stdout.write(`  hold --task-id <uuid> --decision-key <key> --boundaries <comma-list> --reason <reason>\n`);
   process.stdout.write(`  transition --task-id <uuid> --transition-key <key> --to <running|blocked|failed|completed>\n`);
   process.stdout.write(`    [--reason <text>] [--owner <owner>] [--artifacts-json <array>] [--verification-json <array>]\n`);
-  process.stdout.write(`  captain-submit --idempotency-key <key> --instruction-id <id> --objective <text>\n`);
-  process.stdout.write(`    --acceptance-json <array> --repository <ref> --priority <priority> --owner <owner>\n`);
-  process.stdout.write(`    [--task-id <uuid>] [--authorized-boundaries <comma-list|none>]\n`);
-  process.stdout.write(`  captain-directive --task-id <uuid> --action <pause|override|narrow|cancel>\n`);
-  process.stdout.write(`    --instruction-id <id> --direction <text> [--supersedes <instruction-id>]\n`);
-  process.stdout.write(`    [--authorized-boundaries <comma-list|none>] [--owner <owner>]\n`);
   process.stdout.write(`  status [--task-id <uuid>|--objective <text>|--pending|--refusals] [--limit <1-100>]\n`);
   process.stdout.write(`  health\n  recover\n\n`);
+  process.stdout.write(`Captain claims are never admitted on this surface.\n`);
   process.stdout.write(`Higher boundaries: ${[...HIGHER_BOUNDARIES].sort().join(", ")}\n`);
 }
 
-function main() {
-  const { command, flags } = parseArguments(process.argv.slice(2));
+function printTrustedSessionHelp() {
+  process.stdout.write(`fm-principal-session-authority.sh commands:\n\n`);
+  process.stdout.write(`  record-captain-task --idempotency-key <key> --instruction-id <id> --objective <text>\n`);
+  process.stdout.write(`    --acceptance-json <array> --repository <ref> --priority <priority> --owner <owner>\n`);
+  process.stdout.write(`    --source-conversation <ref> [--source-message <ref>] [--task-id <uuid>]\n`);
+  process.stdout.write(`    [--authorized-boundaries <comma-list|none>]\n`);
+  process.stdout.write(`  record-captain-decision --task-id <uuid> --action <pause|override|narrow|cancel>\n`);
+  process.stdout.write(`    --instruction-id <id> --source-conversation <ref> --direction <text>\n`);
+  process.stdout.write(`    [--source-message <ref>] [--supersedes <instruction-id>]\n`);
+  process.stdout.write(`    [--authorized-boundaries <comma-list|none>] [--owner <owner>]\n\n`);
+  process.stdout.write(`This local administrative surface records decisions Firstmate already received in its trusted captain session.\n`);
+  process.stdout.write(`It is not an identity admission or relay ingress surface.\n`);
+  process.stdout.write(`Higher boundaries: ${[...HIGHER_BOUNDARIES].sort().join(", ")}\n`);
+}
+
+function main(argv, surface) {
+  const { command, flags } = parseArguments(argv);
   ensureDirectories();
+  if (command === "help") {
+    if (surface === "trusted-session") printTrustedSessionHelp();
+    else printIngressHelp();
+    return;
+  }
+  if (surface === "trusted-session") {
+    switch (command) {
+      case "record-captain-task":
+        commandRecordCaptainTask(flags);
+        return;
+      case "record-captain-decision":
+        commandRecordCaptainDecision(flags);
+        return;
+      default:
+        fail("usage", `unknown trusted-session command: ${command}`);
+    }
+  }
   switch (command) {
-    case "help":
-      printHelp();
-      return;
     case "ingest":
       commandIngest(flags);
       return;
@@ -1450,12 +1425,6 @@ function main() {
       return;
     case "transition":
       commandTransition(flags);
-      return;
-    case "captain-submit":
-      commandCaptainSubmit(flags);
-      return;
-    case "captain-directive":
-      commandCaptainDirective(flags);
       return;
     case "status":
       commandStatus(flags);
@@ -1471,9 +1440,7 @@ function main() {
   }
 }
 
-try {
-  main();
-} catch (error) {
+function reportCliError(error) {
   if (error instanceof AuthorityError) {
     process.stderr.write(`fm-principal-authority: ${error.code}: ${error.message}\n`);
     process.exitCode = error.code === "usage" ? 2 : 1;
@@ -1481,4 +1448,28 @@ try {
     process.stderr.write(`fm-principal-authority: internal_error: ${error.stack || error.message}\n`);
     process.exitCode = 1;
   }
+}
+
+export function executeIngressCli(argv) {
+  try {
+    main(argv, "ingress");
+  } catch (error) {
+    reportCliError(error);
+  }
+}
+
+export function executeTrustedSessionCli(argv, hooks = {}) {
+  const previous = runtimeHooks;
+  runtimeHooks = Object.freeze({ ...hooks });
+  try {
+    main(argv, "trusted-session");
+  } catch (error) {
+    reportCliError(error);
+  } finally {
+    runtimeHooks = previous;
+  }
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === MODULE_PATH) {
+  executeIngressCli(process.argv.slice(2));
 }

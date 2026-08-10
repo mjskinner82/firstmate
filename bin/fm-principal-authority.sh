@@ -6,10 +6,10 @@
 # requires the configured Mercury caller and key id, reconstructs the exact
 # canonical payload, and verifies assignment_payload_hash before recording any
 # task. Relayed captain text is always recorded as refused unverified input.
-# A direct captain instruction enters only through the captain-submit or
-# captain-directive commands in an active Codex session. The command derives
-# its conversation provenance and configured captain identity from that trusted
-# boundary rather than accepting caller-entered identity flags.
+# This relay-facing executable exposes no captain mutation or identity-admission
+# command. Direct captain decisions are recorded by Firstmate through the
+# separate local fm-principal-session-authority.sh administrative surface after
+# Firstmate receives them in its own trusted interactive session.
 #
 # Durable data lives under data/principal-authority/:
 #   tasks/<task-id>.json       materialized canonical task view
@@ -28,9 +28,6 @@
 #     --boundaries <comma-list> --reason <reason>
 #   fm-principal-authority.sh transition --task-id <uuid> --transition-key <key> \
 #     --to <running|blocked|failed|completed> [state evidence flags]
-#   fm-principal-authority.sh captain-submit [assignment and trusted-source flags]
-#   fm-principal-authority.sh captain-directive --task-id <uuid> \
-#     --action <pause|override|narrow|cancel> [directive flags]
 #   fm-principal-authority.sh status [--task-id <uuid>|--objective <text>|--pending|--refusals]
 #   fm-principal-authority.sh health
 #   fm-principal-authority.sh recover

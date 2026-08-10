@@ -28,7 +28,7 @@ Ordinary dead-direct-report recovery is owned by `stuck-crewmate-recovery`, whil
 
 The optional dual-principal consumer is inert when `state/hermes-ingress.events.jsonl` is absent.
 When that event ledger exists, `config/principal-authority.json` is required as a regular mode-600 file owned by the current user.
-It contains authority identities, not secrets.
+It contains Mercury admission identities and descriptive captain receipt provenance, not secrets.
 The Mercury HMAC secret remains exclusively with the upstream Hermes bridge and never enters Firstmate configuration, task data, receipts, logs, or model context.
 
 The configuration has this exact versioned shape:
@@ -45,16 +45,21 @@ The configuration has this exact versioned shape:
 }
 ```
 
-Each `captain_sources` entry allowlists one exact direct captain identity and trusted channel pair.
+`captain_sources` contains exactly one descriptive direct captain identity and channel pair for receipts recorded by Firstmate's trusted session.
+It is not an ingress allowlist and never authenticates caller-supplied data or ambient process state.
 Each `mercury_sources` entry allowlists one exact authenticated caller and identity key id pair produced by the Hermes bridge after HMAC verification.
-`FM_PRINCIPAL_CONFIG` overrides the config path only for tests or specialized setup.
+`FM_PRINCIPAL_CONFIG` overrides the config path only for tests or specialized setup and is never an identity signal.
 
 Canonical task views live under `data/principal-authority/tasks/`, and content-addressed immutable receipts live under `data/principal-authority/receipts/`.
 Both directories and their files are private to the effective `FM_HOME` and survive process restart.
 The materialized task view is replayable from the contiguous receipt revisions, so a stopped write is recoverable without inventing lifecycle progress.
 The short-lived writer lock lives at `state/.principal-authority.lock` and uses the same stale-owner recovery primitive as the wake queue.
 
-`bin/fm-principal-authority.sh` owns the exact event schema, task schema, lifecycle transitions, receipt format, health contract, commands, and higher-boundary identifiers.
+`bin/fm-principal-authority.sh` owns authenticated Mercury ingress, the exact event schema, lifecycle transitions, status, recovery, and refusal of all relay captain claims.
+`bin/fm-principal-session-authority.sh` is the separate local administrative recorder for captain direction Firstmate already received in its trusted interactive session.
+It accepts no captain identity claim and shares the task schema, receipt format, writer lock, and higher-boundary identifiers with the ingress owner.
+Relay ingestion never invokes this local recorder.
+A process with local write authority to the private Firstmate home is already inside the filesystem trust boundary; the recorder must never be exposed as a relay or remote command endpoint.
 The `principal-authority` agent-only skill owns the Firstmate decision procedure.
 Full locked session start consumes the event ledger and prints `PRINCIPAL_INGRESS:` while an authenticated assignment awaits explicit disposition or when identity, schema, receipt, or task-view drift prevents safe consumption.
 Detect-only and context re-emission paths never consume ingress.

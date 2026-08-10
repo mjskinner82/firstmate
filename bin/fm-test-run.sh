@@ -851,7 +851,7 @@ families_for_changed_path() {
     bin/fm-test-run.sh|bin/fm-test-isolation-proof.sh)
       printf '%s\n' pure-contract-unit
       ;;
-    bin/fm-principal-authority.sh|bin/fm-principal-authority.mjs|.agents/skills/principal-authority/*)
+    bin/fm-principal-authority.sh|bin/fm-principal-authority.mjs|bin/fm-principal-session-authority.sh|bin/fm-principal-session-authority.mjs|tests/fm-principal-authority-session-driver.mjs|.agents/skills/principal-authority/*)
       printf '%s\n' pure-contract-unit
       printf '%s\n' session-bootstrap
       ;;
