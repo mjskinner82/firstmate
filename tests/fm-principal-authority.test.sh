@@ -391,6 +391,40 @@ AFTER_HASH=$(shasum -a 256 "$CAPTAIN_FILE" | awk '{print $1}')
 [ "$BEFORE_HASH" = "$AFTER_HASH" ] || fail "captain precedence receipt changed after later ingress"
 pass "captain direction has absolute precedence with an immutable supersession receipt"
 
+run_session "$HOME_ONE" record-captain-decision \
+  --task-id "$TASK_ONE" \
+  --action pause \
+  --instruction-id captain-pause-1 \
+  --source-conversation captain-precedence-session \
+  --direction 'Pause this objective until I explicitly resume it.' \
+  --supersedes captain-narrow-1 >/dev/null
+if run "$HOME_ONE" transition \
+  --task-id "$TASK_ONE" \
+  --transition-key bypass-captain-pause \
+  --to running >/dev/null 2>&1; then
+  fail "ordinary lifecycle transition bypassed an effective captain pause"
+fi
+STATUS=$(status_task "$HOME_ONE" "$TASK_ONE")
+printf '%s' "$STATUS" | jq -e '
+  .task.state == "blocked" and
+  .task.effective_instruction.instruction_id == "captain-pause-1" and
+  (.task.blockers | map(.kind) == ["captain-pause"])
+' >/dev/null || fail "rejected lifecycle transition did not preserve the captain pause"
+run_session "$HOME_ONE" record-captain-decision \
+  --task-id "$TASK_ONE" \
+  --action narrow \
+  --instruction-id captain-resume-1 \
+  --source-conversation captain-precedence-session \
+  --direction 'Resume within the previously narrowed parser scope.' \
+  --supersedes captain-pause-1 >/dev/null
+STATUS=$(status_task "$HOME_ONE" "$TASK_ONE")
+printf '%s' "$STATUS" | jq -e '
+  .task.state == "running" and
+  .task.effective_instruction.instruction_id == "captain-resume-1" and
+  .task.blockers == []
+' >/dev/null || fail "later captain direction did not explicitly resume the paused task"
+pass "captain pause blocks lifecycle advancement until later captain direction"
+
 run "$HOME_ONE" transition \
   --task-id "$TASK_ONE" \
   --transition-key ordinary-complete \

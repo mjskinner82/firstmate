@@ -444,6 +444,16 @@ function validateTask(task) {
   if (!Array.isArray(task.acceptance_criteria) || !Array.isArray(task.blockers) || !Array.isArray(task.artifacts) || !Array.isArray(task.verification)) {
     fail("task_drift", `task ${task.task_id} has invalid bounded arrays`);
   }
+  if (hasEffectiveCaptainPause(task)) {
+    const pauseBlockers = task.blockers.filter((blocker) => blocker.kind === "captain-pause");
+    if (task.state !== "blocked" || pauseBlockers.length !== 1) {
+      fail("captain_precedence", `task ${task.task_id} does not preserve its effective captain pause`);
+    }
+  }
+}
+
+function hasEffectiveCaptainPause(task) {
+  return task.effective_instruction?.principal === "captain" && task.effective_instruction.action === "pause";
 }
 
 function applyReceipt(base) {
@@ -939,6 +949,9 @@ function commandTransition(flags) {
   if (!task) fail("task_not_found", `task not found: ${taskId}`);
   if (!allowedTransition(task.state, to)) fail("invalid_transition", `task cannot transition from ${task.state} to ${to}`);
   if (!task.lifecycle_timestamps.accepted_at) fail("acceptance_inferred", `${to} requires an explicit accepted transition receipt`);
+  if (hasEffectiveCaptainPause(task) && to !== "blocked") {
+    fail("captain_precedence", "task cannot advance while a captain pause is effective");
+  }
   if (task.authority.captain_required_boundaries.length > 0 && to !== "blocked") {
     fail("captain_precedence", "task cannot advance while higher boundaries await the captain");
   }
