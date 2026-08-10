@@ -8,12 +8,14 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { dirname, join, resolve } from "node:path";
+import { execFileSync, spawnSync } from "node:child_process";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
@@ -965,10 +967,78 @@ function commandTransition(flags) {
   process.stdout.write(`${asciiJson(publicReceipt(receipt), true)}\n`);
 }
 
+function pathIsWithin(root, candidate) {
+  const path = relative(root, candidate);
+  return path === "" || (!path.startsWith("..") && !isAbsolute(path));
+}
+
+function isolatedCaptainTestMode() {
+  if (process.env.FM_PRINCIPAL_TEST_TRUSTED_CAPTAIN !== "1") return false;
+  const root = realpathSync(ROOT);
+  const home = realpathSync(HOME);
+  const data = realpathSync(DATA);
+  const state = realpathSync(STATE);
+  const configDirectory = realpathSync(dirname(CONFIG_PATH));
+  if (home === root || !pathIsWithin(home, data) || !pathIsWithin(home, state) || !pathIsWithin(home, configDirectory)) {
+    fail("captain_identity_rejected", "test captain provenance is restricted to an isolated non-production home");
+  }
+  return true;
+}
+
+function signedCodexAncestor(threadId) {
+  if (process.platform !== "darwin") return null;
+  let pid = process.ppid;
+  for (let depth = 0; depth < 12 && pid > 1; depth += 1) {
+    let parent;
+    let executable;
+    try {
+      parent = Number.parseInt(execFileSync("/bin/ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8" }).trim(), 10);
+      executable = execFileSync("/bin/ps", ["-o", "comm=", "-p", String(pid)], { encoding: "utf8" }).trim();
+    } catch {
+      return null;
+    }
+    if (basename(executable) === "codex") {
+      let argumentsText;
+      let signature;
+      try {
+        const canonicalExecutable = realpathSync(executable);
+        const verification = spawnSync("/usr/bin/codesign", ["--verify", "--strict", canonicalExecutable], {
+          encoding: "utf8",
+        });
+        if (verification.status !== 0) return null;
+        const details = spawnSync("/usr/bin/codesign", ["-dv", "--verbose=4", canonicalExecutable], {
+          encoding: "utf8",
+        });
+        if (details.status !== 0) return null;
+        signature = `${details.stdout || ""}${details.stderr || ""}`;
+        argumentsText = execFileSync("/bin/ps", ["-ww", "-o", "args=", "-p", String(pid)], { encoding: "utf8" });
+      } catch {
+        return null;
+      }
+      if (
+        signature.includes("Identifier=codex") &&
+        signature.includes("TeamIdentifier=2DC432GLL2") &&
+        signature.includes("Authority=Developer ID Application: OpenAI OpCo, LLC (2DC432GLL2)") &&
+        argumentsText.includes(threadId)
+      ) {
+        return executable;
+      }
+      return null;
+    }
+    if (!Number.isInteger(parent) || parent < 1 || parent === pid) return null;
+    pid = parent;
+  }
+  return null;
+}
+
 function captainSource(config) {
   const conversation = process.env.CODEX_THREAD_ID;
-  if (process.env.CODEX_CI !== "1" || !CODEX_THREAD_RE.test(conversation || "")) {
+  if (!CODEX_THREAD_RE.test(conversation || "")) {
     fail("captain_identity_rejected", "captain commands require provenance from an active trusted Codex session");
+  }
+  const testMode = isolatedCaptainTestMode();
+  if (!testMode && !signedCodexAncestor(conversation)) {
+    fail("captain_identity_rejected", "captain commands require a code-signed OpenAI Codex session ancestor");
   }
   const matches = config.captain_sources.filter((source) => source.channel === "codex");
   if (matches.length !== 1) fail("captain_identity_rejected", "the trusted Codex boundary must map to exactly one captain identity");
@@ -1050,6 +1120,13 @@ function commandCaptainSubmit(flags) {
     existing.idempotency_key === event.idempotency_key &&
     existing.effective_instruction.instruction_id === instructionId
   ) {
+    const queuedReplay = replayForCommand(
+      `captain-submit:${event.idempotency_key}:queued`,
+      store.receipts,
+      existing.task_id,
+      operation,
+    );
+    if (!queuedReplay) fail("task_drift", "captain submission task exists without its queued receipt");
     let current = existing;
     if (current.state === "queued") {
       current = transitionReceipt(current, {
@@ -1085,16 +1162,7 @@ function commandCaptainSubmit(flags) {
     fail("task_drift", "captain submission is partially recorded in an unsupported lifecycle state");
   }
   if (existing) {
-    const directiveFlags = {
-      "task-id": existing.task_id,
-      action: "override",
-      "instruction-id": instructionId,
-      direction: objective,
-      "authorized-boundaries": authorized.length > 0 ? authorized.join(",") : "none",
-      owner,
-    };
-    commandCaptainDirective(directiveFlags);
-    return;
+    fail("duplicate_objective", "objective already has a canonical task; use captain-directive for bounded changes");
   }
   const base = makeBaseTask(event, source);
   const timestamp = now();
@@ -1120,6 +1188,10 @@ function commandCaptainSubmit(flags) {
     recorded_at: timestamp,
     task_after: queued,
   });
+  if (isolatedCaptainTestMode() && process.env.FM_PRINCIPAL_TEST_STOP_AFTER_QUEUED === "1") {
+    process.stdout.write(`${asciiJson(publicReceipt(receipt), true)}\n`);
+    return;
+  }
   receipt = transitionReceipt(receipt.task_after, {
     to: "delivered",
     idempotencyKey: `captain-submit:${event.idempotency_key}:delivered`,
@@ -1235,6 +1307,7 @@ function commandCaptainDirective(flags) {
         next.blockers = [{ kind: "captain-pause", reason: direction, boundaries: [], recorded_at: timestamp }];
       } else if (action === "cancel") {
         next.blockers = [];
+        next.authority.captain_required_boundaries = [];
         next.terminal_result = direction;
       } else if (coversHold || clearsCaptainPause || to === "accepted") {
         next.blockers = [];

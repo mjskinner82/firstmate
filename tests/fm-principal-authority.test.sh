@@ -14,7 +14,9 @@ pass() { echo "ok - $*"; }
 run() {
   local home=$1
   shift
-  FM_HOME="$home" FM_PRINCIPAL_NOW="$NOW" "$CMD" "$@"
+  FM_HOME="$home" FM_PRINCIPAL_NOW="$NOW" \
+    FM_PRINCIPAL_TEST_TRUSTED_CAPTAIN="${FM_PRINCIPAL_TEST_TRUSTED_CAPTAIN:-1}" \
+    CODEX_THREAD_ID="${CODEX_THREAD_ID:-019fea30-3856-7cc3-aced-0fdca0a63070}" "$CMD" "$@"
 }
 
 setup_home() {
@@ -252,6 +254,17 @@ printf '%s' "$STATUS" | jq -e '
 ' >/dev/null || fail "direct captain instruction did not explicitly clear the exact held boundary"
 pass "only direct captain direction can clear a held higher boundary"
 
+CAPTAIN_CANCELLED_HELD=22222222-2222-4222-8222-000000000010
+run "$HOME_BOUNDARY" captain-directive \
+  --task-id "$CAPTAIN_CANCELLED_HELD" \
+  --action cancel \
+  --instruction-id captain-cancel-held \
+  --direction 'Cancel this held objective.' >/dev/null
+run "$HOME_BOUNDARY" status --pending | jq -e --arg task "$CAPTAIN_CANCELLED_HELD" '
+  [.tasks[].task_id] | index($task) == null
+' >/dev/null || fail "cancelled held task remained in the pending projection"
+pass "captain cancellation resolves higher-boundary pending status"
+
 # No delivery, process, or forge activity can substitute for acceptance.
 UNACCEPTED=33333333-3333-4333-8333-333333333333
 append_mercury "$HOME_ONE" "$UNACCEPTED" no-inferred-accept no-inferred-accept-v1 'Prepare another ordinary reversible correction.'
@@ -452,7 +465,7 @@ if run "$HOME_CAPTAIN" captain-submit \
   --owner fm/captain-worker >/dev/null 2>&1; then
   fail "captain command accepted caller-entered identity provenance"
 fi
-if CODEX_CI=0 run "$HOME_CAPTAIN" captain-submit \
+if CODEX_THREAD_ID=invalid run "$HOME_CAPTAIN" captain-submit \
   --task-id cccccccc-cccc-4ccc-8ccc-cccccccccccc \
   --idempotency-key missing-captain-provenance \
   --instruction-id missing-captain-provenance \
@@ -464,5 +477,57 @@ if CODEX_CI=0 run "$HOME_CAPTAIN" captain-submit \
   fail "captain command accepted missing trusted-session provenance"
 fi
 pass "both allowlisted captain and authenticated Mercury direction use one canonical lifecycle"
+
+HOME_PARTIAL="$TMP_ROOT/captain-partial"
+setup_home "$HOME_PARTIAL"
+PARTIAL_TASK=dddddddd-dddd-4ddd-8ddd-dddddddddddd
+FM_PRINCIPAL_TEST_STOP_AFTER_QUEUED=1 run "$HOME_PARTIAL" captain-submit \
+  --task-id "$PARTIAL_TASK" \
+  --idempotency-key captain-partial-v1 \
+  --instruction-id captain-partial-instruction-1 \
+  --objective 'Implement a reversible interrupted captain submission.' \
+  --acceptance-json '["The retry preserves the original operation."]' \
+  --repository firstmate \
+  --priority normal \
+  --owner fm/captain-worker >/dev/null
+if run "$HOME_PARTIAL" captain-submit \
+  --task-id eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee \
+  --idempotency-key captain-partial-v1 \
+  --instruction-id captain-partial-instruction-1 \
+  --objective 'Implement a reversible interrupted captain submission.' \
+  --acceptance-json '["The retry preserves the original operation."]' \
+  --repository firstmate \
+  --priority normal \
+  --owner fm/captain-worker >/dev/null 2>&1; then
+  fail "partial captain submission accepted a changed task identity"
+fi
+run "$HOME_PARTIAL" captain-submit \
+  --task-id "$PARTIAL_TASK" \
+  --idempotency-key captain-partial-v1 \
+  --instruction-id captain-partial-instruction-1 \
+  --objective 'Implement a reversible interrupted captain submission.' \
+  --acceptance-json '["The retry preserves the original operation."]' \
+  --repository firstmate \
+  --priority normal \
+  --owner fm/captain-worker >/dev/null
+assert_task_state "$HOME_PARTIAL" "$PARTIAL_TASK" accepted
+pass "partial captain submission retries preserve the original operation"
+
+HOME_DUPLICATE_CAPTAIN="$TMP_ROOT/captain-duplicate-objective"
+setup_home "$HOME_DUPLICATE_CAPTAIN"
+append_mercury "$HOME_DUPLICATE_CAPTAIN" 12121212-1212-4212-8212-121212121212 captain-duplicate captain-duplicate-v1 'Keep one canonical captain objective.'
+run "$HOME_DUPLICATE_CAPTAIN" ingest >/dev/null
+if run "$HOME_DUPLICATE_CAPTAIN" captain-submit \
+  --task-id 13131313-1313-4313-8313-131313131313 \
+  --idempotency-key captain-duplicate-v2 \
+  --instruction-id captain-duplicate-instruction-2 \
+  --objective 'Keep one canonical captain objective.' \
+  --acceptance-json '["Changed acceptance criteria must not be discarded."]' \
+  --repository another-repository \
+  --priority urgent \
+  --owner fm/captain-worker >/dev/null 2>&1; then
+  fail "duplicate captain submission silently discarded direction fields"
+fi
+pass "duplicate objectives require an explicit bounded captain directive"
 
 echo "all fm-principal-authority tests passed"
