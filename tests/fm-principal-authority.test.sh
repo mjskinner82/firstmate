@@ -53,8 +53,13 @@ append_mercury() { # <home> <task-id> <event-seed> <idempotency> <objective>
     --arg channel telegram \
     --arg conversation 8617707440 \
     --arg message "$event_seed" \
+    --arg created_at "2026-08-10T03:38:26.944Z" \
+    --arg event_id "$(sha256_text "$event_seed")" \
+    --arg event_type mercury_engineering_assignment \
+    --arg identity_key_id mercury-firstmate-hmac-v1 \
+    --arg task_id "$task_id" \
     --argjson acceptance "$acceptance" \
-    '{acceptance_criteria:$acceptance,caller_identity:$caller,idempotency_key:$idempotency,objective:$objective,priority:$priority,repository_ref:$repository,source_channel:$channel,source_conversation_ref:$conversation,source_message_ref:$message}')
+    '{acceptance_criteria:$acceptance,caller_identity:$caller,created_at:$created_at,event_id:$event_id,event_type:$event_type,idempotency_key:$idempotency,identity_key_id:$identity_key_id,objective:$objective,priority:$priority,repository_ref:$repository,source_channel:$channel,source_conversation_ref:$conversation,source_message_ref:$message,task_id:$task_id}')
   payload_hash=$(sha256_text "$payload")
   event_id=$(sha256_text "$event_seed")
   jq -cn \
@@ -158,6 +163,22 @@ run "$HOME_TAMPER" status --refusals | jq -e '
   || fail "tampered Mercury payload created a canonical task"
 pass "Mercury caller, key id, and canonical payload integrity are all required"
 
+HOME_TAMPER_TASK="$TMP_ROOT/tampered-mercury-task"
+setup_home "$HOME_TAMPER_TASK"
+TAMPER_TASK_ORIGINAL=99999999-9999-4999-8999-999999999999
+append_mercury "$HOME_TAMPER_TASK" "$TAMPER_TASK_ORIGINAL" tampered-task-event tampered-task-v1 'Implement another reversible tamper test.'
+tampered_task_event="$HOME_TAMPER_TASK/state/tampered-task.jsonl"
+jq -c '.task_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"' \
+  "$HOME_TAMPER_TASK/state/hermes-ingress.events.jsonl" > "$tampered_task_event"
+mv "$tampered_task_event" "$HOME_TAMPER_TASK/state/hermes-ingress.events.jsonl"
+chmod 600 "$HOME_TAMPER_TASK/state/hermes-ingress.events.jsonl"
+if run "$HOME_TAMPER_TASK" ingest >/dev/null 2>&1; then
+  fail "Mercury task identity changed without invalidating payload integrity"
+fi
+[ ! -e "$HOME_TAMPER_TASK/data/principal-authority/tasks/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.json" ] \
+  || fail "tampered Mercury task identity created a canonical task"
+pass "Mercury integrity covers identity, provenance, deduplication, and lifecycle fields"
+
 # Every named higher boundary is an explicit Firstmate assessment that holds
 # the task for a direct captain decision without inventing acceptance.
 HOME_BOUNDARY="$TMP_ROOT/boundaries"
@@ -196,6 +217,15 @@ for boundary in $BOUNDARIES; do
 done
 pass "all higher boundaries hold Mercury work for the captain"
 
+if run "$HOME_BOUNDARY" hold \
+  --task-id 22222222-2222-4222-8222-000000000002 \
+  --decision-key hold-financial-transaction \
+  --boundaries outward-facing-creation \
+  --reason 'The outward-facing-creation boundary requires direct captain authority.' >/dev/null 2>&1; then
+  fail "hold decision key replayed successfully for another task"
+fi
+pass "authority decision replays are bound to one normalized operation"
+
 BOOTSTRAP_OUT=$(FM_HOME="$HOME_BOUNDARY" FM_BACKEND=tmux FM_PRINCIPAL_NOW="$NOW" FM_BOOTSTRAP_NETWORK=skip \
   "$ROOT/bin/fm-bootstrap.sh")
 case "$BOOTSTRAP_OUT" in
@@ -209,9 +239,6 @@ run "$HOME_BOUNDARY" captain-directive \
   --task-id "$CAPTAIN_APPROVED" \
   --action override \
   --instruction-id captain-financial-approval \
-  --source-identity matt \
-  --source-channel codex \
-  --source-conversation captain-trusted-session \
   --direction 'Authorize this exact financial-transaction boundary for the named task only.' \
   --authorized-boundaries financial-transaction \
   --owner fm/captain-approved-worker >/dev/null
@@ -229,6 +256,14 @@ pass "only direct captain direction can clear a held higher boundary"
 UNACCEPTED=33333333-3333-4333-8333-333333333333
 append_mercury "$HOME_ONE" "$UNACCEPTED" no-inferred-accept no-inferred-accept-v1 'Prepare another ordinary reversible correction.'
 run "$HOME_ONE" ingest >/dev/null
+if run "$HOME_ONE" accept \
+  --task-id "$UNACCEPTED" \
+  --decision-key ordinary-accept \
+  --owner fm/ordinary-worker \
+  --assessment 'No higher boundary applies; this is ordinary reversible engineering work.' \
+  --boundaries none >/dev/null 2>&1; then
+  fail "acceptance decision key replayed successfully for another task"
+fi
 if run "$HOME_ONE" transition \
   --task-id "$UNACCEPTED" \
   --transition-key illegal-running \
@@ -253,9 +288,6 @@ CAPTAIN_RECEIPT=$(run "$HOME_ONE" captain-directive \
   --task-id "$TASK_ONE" \
   --action narrow \
   --instruction-id captain-narrow-1 \
-  --source-identity matt \
-  --source-channel codex \
-  --source-conversation captain-trusted-session \
   --direction 'Keep the change limited to parser behavior and its focused tests.' \
   --supersedes "$(sha256_text ordinary-event)")
 CAPTAIN_ID=$(printf '%s' "$CAPTAIN_RECEIPT" | jq -r '.receipt_id')
@@ -302,6 +334,9 @@ append_mercury "$HOME_ONE" "$FAILED_TASK" failed-task failed-task-v1 'Attempt a 
 run "$HOME_ONE" ingest >/dev/null
 run "$HOME_ONE" accept --task-id "$FAILED_TASK" --decision-key failed-accept --owner fm/failure-worker \
   --assessment 'No higher boundary applies.' --boundaries none >/dev/null
+if run "$HOME_ONE" transition --task-id "$FAILED_TASK" --transition-key ordinary-running --to running >/dev/null 2>&1; then
+  fail "transition key replayed successfully for another task"
+fi
 run "$HOME_ONE" transition --task-id "$FAILED_TASK" --transition-key failed-terminal --to failed \
   --reason 'The focused experiment failed its invariant.' >/dev/null
 assert_task_state "$HOME_ONE" "$FAILED_TASK" failed
@@ -315,11 +350,17 @@ run "$HOME_ONE" captain-directive \
   --task-id "$CANCEL_TASK" \
   --action cancel \
   --instruction-id captain-cancel-1 \
-  --source-identity matt \
-  --source-channel codex \
-  --source-conversation captain-trusted-session \
   --direction 'Cancel this objective.' >/dev/null
 assert_task_state "$HOME_ONE" "$CANCEL_TASK" cancelled
+
+if run "$HOME_ONE" captain-directive \
+  --task-id "$CANCEL_TASK" \
+  --action cancel \
+  --instruction-id captain-narrow-1 \
+  --direction 'Cancel this different objective.' >/dev/null 2>&1; then
+  fail "captain instruction key replayed successfully for another task"
+fi
+pass "captain directive replays cannot cross task boundaries"
 
 jq -s -e '
   [.[].to_state] as $states |
@@ -344,6 +385,9 @@ mv "$TASK_FILE" "$TASK_FILE.interrupted"
 if run "$HOME_ONE" health >/dev/null 2>&1; then
   fail "health silently accepted a missing materialized task view"
 fi
+if run "$HOME_ONE" ingest >/dev/null 2>&1; then
+  fail "routine ingress silently repaired a missing materialized task view"
+fi
 run "$HOME_ONE" recover >/dev/null
 run "$HOME_ONE" health | jq -e '.healthy == true' >/dev/null \
   || fail "receipt replay did not restore a healthy canonical task view"
@@ -359,9 +403,6 @@ CAPTAIN_SUBMIT=$(run "$HOME_CAPTAIN" captain-submit \
   --task-id "$CAPTAIN_TASK" \
   --idempotency-key captain-submit-v1 \
   --instruction-id captain-submit-instruction-1 \
-  --source-identity matt \
-  --source-channel codex \
-  --source-conversation captain-trusted-session \
   --objective 'Implement a reversible captain-authored documentation correction.' \
   --acceptance-json '["The correction is focused and tested."]' \
   --repository firstmate \
@@ -372,7 +413,8 @@ printf '%s' "$CAPTAIN_SUBMIT" | jq -e '.from_state == "delivered" and .to_state 
 STATUS=$(status_task "$HOME_CAPTAIN" "$CAPTAIN_TASK")
 printf '%s' "$STATUS" | jq -e '
   .task.source_identity.principal == "captain" and
-  .task.source_identity.verification == "direct-trusted-captain-channel" and
+  .task.source_identity.verification == "codex-trusted-session-context" and
+  .task.source_conversation.conversation == env.CODEX_THREAD_ID and
   .task.state == "accepted" and
   ([.receipts[].to_state] == ["queued","delivered","accepted"])
 ' >/dev/null || fail "direct captain submission did not use the canonical lifecycle"
@@ -380,9 +422,6 @@ REPLAY=$(run "$HOME_CAPTAIN" captain-submit \
   --task-id "$CAPTAIN_TASK" \
   --idempotency-key captain-submit-v1 \
   --instruction-id captain-submit-instruction-1 \
-  --source-identity matt \
-  --source-channel codex \
-  --source-conversation captain-trusted-session \
   --objective 'Implement a reversible captain-authored documentation correction.' \
   --acceptance-json '["The correction is focused and tested."]' \
   --repository firstmate \
@@ -390,6 +429,40 @@ REPLAY=$(run "$HOME_CAPTAIN" captain-submit \
   --owner fm/captain-worker)
 [ "$(printf '%s' "$REPLAY" | jq -r '.receipt_id')" = "$(printf '%s' "$CAPTAIN_SUBMIT" | jq -r '.receipt_id')" ] \
   || fail "direct captain submission retry produced a duplicate receipt"
+if run "$HOME_CAPTAIN" captain-submit \
+  --task-id aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa \
+  --idempotency-key captain-submit-v1 \
+  --instruction-id captain-submit-instruction-1 \
+  --objective 'Implement a reversible captain-authored documentation correction.' \
+  --acceptance-json '["The correction is focused and tested."]' \
+  --repository firstmate \
+  --priority normal \
+  --owner fm/captain-worker >/dev/null 2>&1; then
+  fail "captain submission key replayed successfully for another task"
+fi
+if run "$HOME_CAPTAIN" captain-submit \
+  --task-id bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb \
+  --idempotency-key caller-asserted-captain \
+  --instruction-id caller-asserted-captain \
+  --source-identity matt \
+  --objective 'Attempt caller-asserted captain authority.' \
+  --acceptance-json '["The caller assertion is rejected."]' \
+  --repository firstmate \
+  --priority normal \
+  --owner fm/captain-worker >/dev/null 2>&1; then
+  fail "captain command accepted caller-entered identity provenance"
+fi
+if CODEX_CI=0 run "$HOME_CAPTAIN" captain-submit \
+  --task-id cccccccc-cccc-4ccc-8ccc-cccccccccccc \
+  --idempotency-key missing-captain-provenance \
+  --instruction-id missing-captain-provenance \
+  --objective 'Attempt captain authority without trusted session provenance.' \
+  --acceptance-json '["The missing provenance is rejected."]' \
+  --repository firstmate \
+  --priority normal \
+  --owner fm/captain-worker >/dev/null 2>&1; then
+  fail "captain command accepted missing trusted-session provenance"
+fi
 pass "both allowlisted captain and authenticated Mercury direction use one canonical lifecycle"
 
 echo "all fm-principal-authority tests passed"

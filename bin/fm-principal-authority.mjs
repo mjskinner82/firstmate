@@ -74,6 +74,7 @@ const MERCURY_EVENT_KEYS = new Set([
   "task_id",
 ]);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CODEX_THREAD_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 
 class AuthorityError extends Error {
@@ -366,6 +367,15 @@ function receiptForKey(idempotencyKey, receipts = null) {
   return rows.find((receipt) => receipt.idempotency_key === idempotencyKey) || null;
 }
 
+function replayForCommand(idempotencyKey, receipts, taskId, operation) {
+  const receipt = receiptForKey(idempotencyKey, receipts);
+  if (!receipt) return null;
+  if (receipt.task_id !== taskId || receipt.operation_hash !== hashValue(operation)) {
+    fail("idempotency_conflict", `command idempotency key was reused for another operation: ${idempotencyKey}`);
+  }
+  return receipt;
+}
+
 function recoverStore({ repair }) {
   ensureDirectories();
   const receipts = listReceipts();
@@ -470,6 +480,7 @@ function transitionReceipt(task, options) {
     authority: options.authority || null,
     supersedes_instruction_id: options.supersedesInstructionId || null,
     notification_class: options.notificationClass || "silent",
+    operation_hash: options.operationHash || null,
     recorded_at: timestamp,
     task_after: next,
   });
@@ -485,13 +496,18 @@ function assignmentPayload(event) {
   return {
     acceptance_criteria: event.acceptance_criteria,
     caller_identity: event.authenticated_caller,
+    created_at: event.created_at,
+    event_id: event.event_id,
+    event_type: event.event_type,
     idempotency_key: event.idempotency_key,
+    identity_key_id: event.identity_key_id,
     objective: event.objective,
     priority: event.priority,
     repository_ref: event.repository_ref,
     source_channel: event.source_channel,
     source_conversation_ref: event.source_conversation_ref,
     source_message_ref: event.source_message_ref,
+    task_id: event.task_id,
   };
 }
 
@@ -716,7 +732,7 @@ function ingestMercury(event, store) {
 function commandIngest(flags) {
   rejectUnknownFlags(flags, new Set(["events"]));
   const eventsPath = flags.events ? resolve(flags.events) : DEFAULT_EVENTS;
-  const store = recoverStore({ repair: true });
+  const store = recoverStore({ repair: false });
   if (!existsSync(eventsPath)) {
     process.stdout.write(`${asciiJson({ schema: STATUS_SCHEMA, new_tasks: 0, delivered: 0, duplicates: 0, refused: 0, pending: pendingTasks(store.tasks).length })}\n`);
     return;
@@ -770,7 +786,7 @@ function commandIngest(flags) {
     }
     try {
       validateMercuryEvent(config, event, index + 1);
-      const before = recoverStore({ repair: true });
+      const before = recoverStore({ repair: false });
       const result = ingestMercury(event, before);
       if (result.kind === "delivered") {
         summary.new_tasks += before.tasks.has(event.task_id) ? 0 : 1;
@@ -789,7 +805,7 @@ function commandIngest(flags) {
       if (refusal.isNew) summary.refused += 1;
     }
   }
-  const finalStore = recoverStore({ repair: true });
+  const finalStore = recoverStore({ repair: false });
   summary.pending = pendingTasks(finalStore.tasks).length;
   process.stdout.write(`${asciiJson(summary)}\n`);
   if (errors.length > 0) fail("ingress_refused", errors.join("; "));
@@ -804,8 +820,9 @@ function commandAccept(flags) {
   const boundaries = parseBoundaries(requireFlag(flags, "boundaries", 500), { allowNone: true });
   if (boundaries.length !== 0) fail("captain_required", "Mercury standing authority applies only when the assessed higher-boundary list is none");
   const config = readConfig();
-  const store = recoverStore({ repair: true });
-  const replay = receiptForKey(`accept:${decisionKey}`, store.receipts);
+  const store = recoverStore({ repair: false });
+  const operation = { command: "accept", task_id: taskId, owner, assessment, boundaries };
+  const replay = replayForCommand(`accept:${decisionKey}`, store.receipts, taskId, operation);
   if (replay) {
     process.stdout.write(`${asciiJson(publicReceipt(replay), true)}\n`);
     return;
@@ -832,6 +849,7 @@ function commandAccept(flags) {
     reason: assessment,
     authority: { basis: "mercury-standing-ordinary-reversible", boundaries: [] },
     notificationClass: "acceptance",
+    operationHash: hashValue(operation),
     mutate(next) {
       next.owner = owner;
       next.blockers = [];
@@ -853,8 +871,9 @@ function commandHold(flags) {
   const decisionKey = requireFlag(flags, "decision-key", 300);
   const boundaries = parseBoundaries(requireFlag(flags, "boundaries", 500));
   const reason = requireFlag(flags, "reason", 2000);
-  const store = recoverStore({ repair: true });
-  const replay = receiptForKey(`hold:${decisionKey}`, store.receipts);
+  const store = recoverStore({ repair: false });
+  const operation = { command: "hold", task_id: taskId, boundaries, reason };
+  const replay = replayForCommand(`hold:${decisionKey}`, store.receipts, taskId, operation);
   if (replay) {
     process.stdout.write(`${asciiJson(publicReceipt(replay), true)}\n`);
     return;
@@ -869,6 +888,7 @@ function commandHold(flags) {
     reason,
     authority: { basis: "captain-required-higher-boundary", boundaries },
     notificationClass: "captain-decision",
+    operationHash: hashValue(operation),
     mutate(next, timestamp) {
       next.authority.assessed_by = "firstmate";
       next.authority.assessment = reason;
@@ -897,19 +917,6 @@ function commandTransition(flags) {
   const transitionKey = requireFlag(flags, "transition-key", 300);
   const to = requireFlag(flags, "to", 50);
   if (!["running", "blocked", "failed", "completed"].includes(to)) fail("invalid_transition", `unsupported lifecycle destination: ${to}`);
-  const store = recoverStore({ repair: true });
-  const replay = receiptForKey(`transition:${transitionKey}`, store.receipts);
-  if (replay) {
-    process.stdout.write(`${asciiJson(publicReceipt(replay), true)}\n`);
-    return;
-  }
-  const task = store.tasks.get(taskId);
-  if (!task) fail("task_not_found", `task not found: ${taskId}`);
-  if (!allowedTransition(task.state, to)) fail("invalid_transition", `task cannot transition from ${task.state} to ${to}`);
-  if (!task.lifecycle_timestamps.accepted_at) fail("acceptance_inferred", `${to} requires an explicit accepted transition receipt`);
-  if (task.authority.captain_required_boundaries.length > 0 && to !== "blocked") {
-    fail("captain_precedence", "task cannot advance while higher boundaries await the captain");
-  }
   const reason = flags.reason ? boundedText(flags.reason, "--reason", 4000) : "Lifecycle transition recorded by Firstmate.";
   if (["blocked", "failed", "completed"].includes(to) && !flags.reason) fail("usage", `--reason is required for ${to}`);
   const artifacts = normalizeEvidence(parseJsonArray(flags["artifacts-json"] || "[]", "artifacts-json"), "artifacts", ["label", "ref"]);
@@ -924,14 +931,30 @@ function commandTransition(flags) {
   if (to === "completed" && (artifacts.length === 0 || verification.length === 0)) {
     fail("invalid_transition", "completed requires at least one artifact and one verification result");
   }
+  const owner = flags.owner ? boundedText(flags.owner, "--owner", 500) : null;
+  const operation = { command: "transition", task_id: taskId, to, reason, owner, artifacts, verification };
+  const store = recoverStore({ repair: false });
+  const replay = replayForCommand(`transition:${transitionKey}`, store.receipts, taskId, operation);
+  if (replay) {
+    process.stdout.write(`${asciiJson(publicReceipt(replay), true)}\n`);
+    return;
+  }
+  const task = store.tasks.get(taskId);
+  if (!task) fail("task_not_found", `task not found: ${taskId}`);
+  if (!allowedTransition(task.state, to)) fail("invalid_transition", `task cannot transition from ${task.state} to ${to}`);
+  if (!task.lifecycle_timestamps.accepted_at) fail("acceptance_inferred", `${to} requires an explicit accepted transition receipt`);
+  if (task.authority.captain_required_boundaries.length > 0 && to !== "blocked") {
+    fail("captain_precedence", "task cannot advance while higher boundaries await the captain");
+  }
   const receipt = transitionReceipt(task, {
     to,
     idempotencyKey: `transition:${transitionKey}`,
     source: { principal: "firstmate", channel: "local", conversation: "task-lifecycle" },
     reason,
     notificationClass: ["failed", "completed"].includes(to) ? "terminal" : "silent",
+    operationHash: hashValue(operation),
     mutate(next, timestamp) {
-      if (flags.owner) next.owner = boundedText(flags.owner, "--owner", 500);
+      if (owner) next.owner = owner;
       if (to === "blocked") next.blockers = [{ kind: "operational", reason, boundaries: [], recorded_at: timestamp }];
       else next.blockers = [];
       if (artifacts.length > 0) next.artifacts = artifacts;
@@ -942,21 +965,24 @@ function commandTransition(flags) {
   process.stdout.write(`${asciiJson(publicReceipt(receipt), true)}\n`);
 }
 
-function captainSource(config, flags) {
-  const identity = requireFlag(flags, "source-identity", 200);
-  const channel = requireFlag(flags, "source-channel", 200);
-  const conversation = requireFlag(flags, "source-conversation", 500);
-  const message = flags["source-message"] ? boundedText(flags["source-message"], "--source-message", 500) : null;
+function captainSource(config) {
+  const conversation = process.env.CODEX_THREAD_ID;
+  if (process.env.CODEX_CI !== "1" || !CODEX_THREAD_RE.test(conversation || "")) {
+    fail("captain_identity_rejected", "captain commands require provenance from an active trusted Codex session");
+  }
+  const matches = config.captain_sources.filter((source) => source.channel === "codex");
+  if (matches.length !== 1) fail("captain_identity_rejected", "the trusted Codex boundary must map to exactly one captain identity");
+  const [{ identity, channel }] = matches;
   validateCaptainSource(config, identity, channel);
   return {
     principal: "captain",
     identity,
     identity_key_id: null,
     identity_verified: true,
-    verification: "direct-trusted-captain-channel",
+    verification: "codex-trusted-session-context",
     channel,
     conversation,
-    message,
+    message: null,
   };
 }
 
@@ -967,10 +993,6 @@ function commandCaptainSubmit(flags) {
       "task-id",
       "idempotency-key",
       "instruction-id",
-      "source-identity",
-      "source-channel",
-      "source-conversation",
-      "source-message",
       "objective",
       "acceptance-json",
       "repository",
@@ -980,7 +1002,7 @@ function commandCaptainSubmit(flags) {
     ]),
   );
   const config = readConfig();
-  const source = captainSource(config, flags);
+  const source = captainSource(config);
   const instructionId = requireFlag(flags, "instruction-id", 300);
   source.instruction_id = instructionId;
   const objective = requireFlag(flags, "objective", 12000);
@@ -996,7 +1018,7 @@ function commandCaptainSubmit(flags) {
   if (!PRIORITIES.has(event.priority)) fail("invalid_input", "priority must be low, normal, high, or urgent");
   const owner = requireFlag(flags, "owner", 500);
   const authorized = parseBoundaries(flags["authorized-boundaries"] || "none", { allowNone: true });
-  const store = recoverStore({ repair: true });
+  const store = recoverStore({ repair: false });
   const hash = objectiveHash(objective);
   const taskWithIdempotency = [...store.tasks.values()].find(
     (task) => task.idempotency_key === event.idempotency_key,
@@ -1004,7 +1026,20 @@ function commandCaptainSubmit(flags) {
   if (taskWithIdempotency && taskWithIdempotency.objective_hash !== hash) {
     fail("idempotency_conflict", `assignment idempotency key ${event.idempotency_key} maps to another objective`);
   }
-  const replay = receiptForKey(`captain-submit:${event.idempotency_key}:accepted`, store.receipts);
+  const operation = {
+    command: "captain-submit",
+    task_id: flags["task-id"] || null,
+    instruction_id: instructionId,
+    source,
+    event: { ...event, task_id: flags["task-id"] || null },
+    owner,
+    authorized_boundaries: authorized,
+  };
+  const replayKey = `captain-submit:${event.idempotency_key}:accepted`;
+  const existingReplay = receiptForKey(replayKey, store.receipts);
+  const replay = existingReplay
+    ? replayForCommand(replayKey, store.receipts, flags["task-id"] || existingReplay.task_id, operation)
+    : null;
   if (replay) {
     process.stdout.write(`${asciiJson(publicReceipt(replay), true)}\n`);
     return;
@@ -1032,6 +1067,7 @@ function commandCaptainSubmit(flags) {
         reason: "The direct captain instruction was explicitly accepted.",
         authority: { basis: "captain-direct", boundaries: authorized },
         notificationClass: "acceptance",
+        operationHash: hashValue(operation),
         mutate(next) {
           next.owner = owner;
           next.authority = {
@@ -1053,14 +1089,10 @@ function commandCaptainSubmit(flags) {
       "task-id": existing.task_id,
       action: "override",
       "instruction-id": instructionId,
-      "source-identity": source.identity,
-      "source-channel": source.channel,
-      "source-conversation": source.conversation,
       direction: objective,
       "authorized-boundaries": authorized.length > 0 ? authorized.join(",") : "none",
       owner,
     };
-    if (source.message) directiveFlags["source-message"] = source.message;
     commandCaptainDirective(directiveFlags);
     return;
   }
@@ -1084,6 +1116,7 @@ function commandCaptainSubmit(flags) {
     authority: { basis: "captain-direct", boundaries: authorized },
     supersedes_instruction_id: null,
     notification_class: "silent",
+    operation_hash: hashValue(operation),
     recorded_at: timestamp,
     task_after: queued,
   });
@@ -1092,6 +1125,7 @@ function commandCaptainSubmit(flags) {
     idempotencyKey: `captain-submit:${event.idempotency_key}:delivered`,
     source: { ...source, instruction_id: instructionId },
     reason: "The direct captain instruction reached Firstmate.",
+    operationHash: hashValue(operation),
   });
   receipt = transitionReceipt(receipt.task_after, {
     to: "accepted",
@@ -1100,6 +1134,7 @@ function commandCaptainSubmit(flags) {
     reason: "The direct captain instruction was explicitly accepted.",
     authority: { basis: "captain-direct", boundaries: authorized },
     notificationClass: "acceptance",
+    operationHash: hashValue(operation),
     mutate(next) {
       next.owner = owner;
       next.authority = {
@@ -1121,10 +1156,6 @@ function commandCaptainDirective(flags) {
       "task-id",
       "action",
       "instruction-id",
-      "source-identity",
-      "source-channel",
-      "source-conversation",
-      "source-message",
       "direction",
       "supersedes",
       "authorized-boundaries",
@@ -1132,15 +1163,28 @@ function commandCaptainDirective(flags) {
     ]),
   );
   const config = readConfig();
-  const source = captainSource(config, flags);
+  const source = captainSource(config);
   const taskId = requireFlag(flags, "task-id", 100);
   const action = requireFlag(flags, "action", 50);
   if (!["pause", "override", "narrow", "cancel"].includes(action)) fail("invalid_input", "captain action must be pause, override, narrow, or cancel");
   const instructionId = requireFlag(flags, "instruction-id", 300);
   const direction = requireFlag(flags, "direction", 12000);
   const authorized = parseBoundaries(flags["authorized-boundaries"] || "none", { allowNone: true });
-  const store = recoverStore({ repair: true });
-  const replay = receiptForKey(`captain-directive:${instructionId}`, store.receipts);
+  const suppliedSupersedes = flags.supersedes ? boundedText(flags.supersedes, "--supersedes", 300) : null;
+  const owner = flags.owner ? boundedText(flags.owner, "--owner", 500) : null;
+  const store = recoverStore({ repair: false });
+  const operation = {
+    command: "captain-directive",
+    task_id: taskId,
+    action,
+    instruction_id: instructionId,
+    source,
+    direction,
+    supersedes: suppliedSupersedes,
+    authorized_boundaries: authorized,
+    owner,
+  };
+  const replay = replayForCommand(`captain-directive:${instructionId}`, store.receipts, taskId, operation);
   if (replay) {
     process.stdout.write(`${asciiJson(publicReceipt(replay), true)}\n`);
     return;
@@ -1148,7 +1192,7 @@ function commandCaptainDirective(flags) {
   const task = store.tasks.get(taskId);
   if (!task) fail("task_not_found", `task not found: ${taskId}`);
   const supersedes = task.effective_instruction.instruction_id;
-  if (flags.supersedes && boundedText(flags.supersedes, "--supersedes", 300) !== supersedes) {
+  if (suppliedSupersedes && suppliedSupersedes !== supersedes) {
     fail("cross_task_authorization_rejected", "captain supersession reference does not match this task's current instruction");
   }
   let to = task.state;
@@ -1176,6 +1220,7 @@ function commandCaptainDirective(flags) {
     authority: { basis: "captain-direct", boundaries: authorized, action },
     supersedesInstructionId: supersedes,
     notificationClass: "captain-direction",
+    operationHash: hashValue(operation),
     mutate(next, timestamp) {
       next.effective_instruction = {
         instruction_id: instructionId,
@@ -1185,7 +1230,7 @@ function commandCaptainDirective(flags) {
         source_channel: source.channel,
         source_conversation: source.conversation,
       };
-      if (flags.owner) next.owner = boundedText(flags.owner, "--owner", 500);
+      if (owner) next.owner = owner;
       if (action === "pause") {
         next.blockers = [{ kind: "captain-pause", reason: direction, boundaries: [], recorded_at: timestamp }];
       } else if (action === "cancel") {
@@ -1303,14 +1348,12 @@ function printHelp() {
   process.stdout.write(`  hold --task-id <uuid> --decision-key <key> --boundaries <comma-list> --reason <reason>\n`);
   process.stdout.write(`  transition --task-id <uuid> --transition-key <key> --to <running|blocked|failed|completed>\n`);
   process.stdout.write(`    [--reason <text>] [--owner <owner>] [--artifacts-json <array>] [--verification-json <array>]\n`);
-  process.stdout.write(`  captain-submit --idempotency-key <key> --instruction-id <id> --source-identity <id>\n`);
-  process.stdout.write(`    --source-channel <channel> --source-conversation <ref> --objective <text>\n`);
+  process.stdout.write(`  captain-submit --idempotency-key <key> --instruction-id <id> --objective <text>\n`);
   process.stdout.write(`    --acceptance-json <array> --repository <ref> --priority <priority> --owner <owner>\n`);
-  process.stdout.write(`    [--task-id <uuid>] [--source-message <ref>] [--authorized-boundaries <comma-list|none>]\n`);
+  process.stdout.write(`    [--task-id <uuid>] [--authorized-boundaries <comma-list|none>]\n`);
   process.stdout.write(`  captain-directive --task-id <uuid> --action <pause|override|narrow|cancel>\n`);
-  process.stdout.write(`    --instruction-id <id> --source-identity <id> --source-channel <channel>\n`);
-  process.stdout.write(`    --source-conversation <ref> --direction <text> [--supersedes <instruction-id>]\n`);
-  process.stdout.write(`    [--source-message <ref>] [--authorized-boundaries <comma-list|none>] [--owner <owner>]\n`);
+  process.stdout.write(`    --instruction-id <id> --direction <text> [--supersedes <instruction-id>]\n`);
+  process.stdout.write(`    [--authorized-boundaries <comma-list|none>] [--owner <owner>]\n`);
   process.stdout.write(`  status [--task-id <uuid>|--objective <text>|--pending|--refusals] [--limit <1-100>]\n`);
   process.stdout.write(`  health\n  recover\n\n`);
   process.stdout.write(`Higher boundaries: ${[...HIGHER_BOUNDARIES].sort().join(", ")}\n`);

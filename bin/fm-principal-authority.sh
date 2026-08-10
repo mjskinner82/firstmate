@@ -7,8 +7,9 @@
 # canonical payload, and verifies assignment_payload_hash before recording any
 # task. Relayed captain text is always recorded as refused unverified input.
 # A direct captain instruction enters only through the captain-submit or
-# captain-directive commands after the current trusted channel has supplied an
-# allowlisted identity and channel from config/principal-authority.json.
+# captain-directive commands in an active Codex session. The command derives
+# its conversation provenance and configured captain identity from that trusted
+# boundary rather than accepting caller-entered identity flags.
 #
 # Durable data lives under data/principal-authority/:
 #   tasks/<task-id>.json       materialized canonical task view
