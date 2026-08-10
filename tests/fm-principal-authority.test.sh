@@ -391,6 +391,11 @@ AFTER_HASH=$(shasum -a 256 "$CAPTAIN_FILE" | awk '{print $1}')
 [ "$BEFORE_HASH" = "$AFTER_HASH" ] || fail "captain precedence receipt changed after later ingress"
 pass "captain direction has absolute precedence with an immutable supersession receipt"
 
+run "$HOME_ONE" hold \
+  --task-id "$TASK_ONE" \
+  --decision-key pause-independent-hold \
+  --boundaries financial-transaction \
+  --reason 'The financial-transaction boundary requires direct captain authority.' >/dev/null
 run_session "$HOME_ONE" record-captain-decision \
   --task-id "$TASK_ONE" \
   --action pause \
@@ -408,7 +413,8 @@ STATUS=$(status_task "$HOME_ONE" "$TASK_ONE")
 printf '%s' "$STATUS" | jq -e '
   .task.state == "blocked" and
   .task.effective_instruction.instruction_id == "captain-pause-1" and
-  (.task.blockers | map(.kind) == ["captain-pause"])
+  .task.authority.captain_required_boundaries == ["financial-transaction"] and
+  (.task.blockers | map(.kind) == ["captain-approval", "captain-pause"])
 ' >/dev/null || fail "rejected lifecycle transition did not preserve the captain pause"
 run_session "$HOME_ONE" record-captain-decision \
   --task-id "$TASK_ONE" \
@@ -419,11 +425,28 @@ run_session "$HOME_ONE" record-captain-decision \
   --supersedes captain-pause-1 >/dev/null
 STATUS=$(status_task "$HOME_ONE" "$TASK_ONE")
 printf '%s' "$STATUS" | jq -e '
-  .task.state == "running" and
+  .task.state == "blocked" and
   .task.effective_instruction.instruction_id == "captain-resume-1" and
+  .task.authority.captain_required_boundaries == ["financial-transaction"] and
+  (.task.blockers | map(.kind) == ["captain-approval"])
+' >/dev/null || fail "captain pause resumption cleared an unauthorized higher-boundary hold"
+run_session "$HOME_ONE" record-captain-decision \
+  --task-id "$TASK_ONE" \
+  --action override \
+  --instruction-id captain-authorize-held-resume-1 \
+  --source-conversation captain-precedence-session \
+  --direction 'Authorize this exact financial-transaction boundary and resume the task.' \
+  --authorized-boundaries financial-transaction \
+  --supersedes captain-resume-1 >/dev/null
+STATUS=$(status_task "$HOME_ONE" "$TASK_ONE")
+printf '%s' "$STATUS" | jq -e '
+  .task.state == "running" and
+  .task.effective_instruction.instruction_id == "captain-authorize-held-resume-1" and
+  .task.authority.captain_required_boundaries == [] and
+  .task.authority.captain_authorized_boundaries == ["financial-transaction"] and
   .task.blockers == []
-' >/dev/null || fail "later captain direction did not explicitly resume the paused task"
-pass "captain pause blocks lifecycle advancement until later captain direction"
+' >/dev/null || fail "explicit captain boundary authorization did not resume the held task"
+pass "captain pause and higher-boundary holds clear independently"
 
 run "$HOME_ONE" transition \
   --task-id "$TASK_ONE" \

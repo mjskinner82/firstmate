@@ -450,6 +450,16 @@ function validateTask(task) {
       fail("captain_precedence", `task ${task.task_id} does not preserve its effective captain pause`);
     }
   }
+  if (task.authority.captain_required_boundaries.length > 0) {
+    const approvalBlockers = task.blockers.filter((blocker) => blocker.kind === "captain-approval");
+    if (
+      task.state !== "blocked" ||
+      approvalBlockers.length !== 1 ||
+      asciiJson(approvalBlockers[0].boundaries) !== asciiJson(task.authority.captain_required_boundaries)
+    ) {
+      fail("captain_precedence", `task ${task.task_id} does not preserve its higher-boundary hold`);
+    }
+  }
 }
 
 function hasEffectiveCaptainPause(task) {
@@ -1234,12 +1244,13 @@ function commandRecordCaptainDecision(flags) {
   let to = task.state;
   if (action === "pause") to = "blocked";
   if (action === "cancel") to = "cancelled";
+  const hasHigherBoundaryHold = task.authority.captain_required_boundaries.length > 0;
   const coversHold = task.authority.captain_required_boundaries.every((boundary) => authorized.includes(boundary));
-  if (["override", "narrow"].includes(action) && task.authority.captain_required_boundaries.length > 0 && coversHold) {
+  if (["override", "narrow"].includes(action) && hasHigherBoundaryHold && coversHold) {
     to = task.lifecycle_timestamps.accepted_at ? "running" : "accepted";
   }
   const clearsCaptainPause = task.blockers.some((blocker) => blocker.kind === "captain-pause");
-  if (["override", "narrow"].includes(action) && clearsCaptainPause) {
+  if (["override", "narrow"].includes(action) && clearsCaptainPause && (!hasHigherBoundaryHold || coversHold)) {
     to = task.lifecycle_timestamps.accepted_at ? "running" : "delivered";
   }
   if (["override", "narrow"].includes(action) && task.state === "delivered") to = "accepted";
@@ -1268,18 +1279,23 @@ function commandRecordCaptainDecision(flags) {
       };
       if (owner) next.owner = owner;
       if (action === "pause") {
-        next.blockers = [{ kind: "captain-pause", reason: direction, boundaries: [], recorded_at: timestamp }];
+        next.blockers = [
+          ...next.blockers.filter((blocker) => blocker.kind === "captain-approval"),
+          { kind: "captain-pause", reason: direction, boundaries: [], recorded_at: timestamp },
+        ];
       } else if (action === "cancel") {
         next.blockers = [];
         next.authority.captain_required_boundaries = [];
         next.terminal_result = direction;
-      } else if (coversHold || clearsCaptainPause || to === "accepted") {
+      } else if (coversHold || to === "accepted") {
         next.blockers = [];
         next.authority.captain_required_boundaries = [];
         next.authority.captain_authorized_boundaries = authorized;
         next.authority.basis = "captain-direct";
         next.authority.assessed_by = "captain";
         next.authority.assessment = direction;
+      } else if (clearsCaptainPause) {
+        next.blockers = next.blockers.filter((blocker) => blocker.kind !== "captain-pause");
       }
     },
   });
