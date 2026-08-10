@@ -100,6 +100,23 @@ assert_task_state() {
     || fail "task $task_id expected state $expected"
 }
 
+setup_running_task() { # <home> <task-id> <event-seed> <idempotency> <objective>
+  local home=$1 task_id=$2 event_seed=$3 idempotency=$4 objective=$5
+  setup_home "$home"
+  append_mercury "$home" "$task_id" "$event_seed" "$idempotency" "$objective"
+  run "$home" ingest >/dev/null
+  run "$home" accept \
+    --task-id "$task_id" \
+    --decision-key "${idempotency}-accept" \
+    --owner fm/constraint-worker \
+    --assessment 'No higher boundary applies to the initial reversible assignment.' \
+    --boundaries none >/dev/null
+  run "$home" transition \
+    --task-id "$task_id" \
+    --transition-key "${idempotency}-running" \
+    --to running >/dev/null
+}
+
 HOME_ONE="$TMP_ROOT/ordinary"
 setup_home "$HOME_ONE"
 TASK_ONE=11111111-1111-4111-8111-111111111111
@@ -447,6 +464,184 @@ printf '%s' "$STATUS" | jq -e '
   .task.blockers == []
 ' >/dev/null || fail "explicit captain boundary authorization did not resume the held task"
 pass "captain pause and higher-boundary holds clear independently"
+
+# Constraint application and clearing are order-independent. Both homes use the
+# same semantic inputs in opposite order and must reach the same derived state.
+HOME_ORDER_A="$TMP_ROOT/constraints-order-a"
+HOME_ORDER_B="$TMP_ROOT/constraints-order-b"
+ORDER_TASK=14141414-1414-4414-8414-141414141414
+ORDER_OBJECTIVE='Exercise order-independent captain constraints.'
+setup_running_task "$HOME_ORDER_A" "$ORDER_TASK" constraints-order-event constraints-order-v1 "$ORDER_OBJECTIVE"
+setup_running_task "$HOME_ORDER_B" "$ORDER_TASK" constraints-order-event constraints-order-v1 "$ORDER_OBJECTIVE"
+
+run_session "$HOME_ORDER_A" record-captain-decision \
+  --task-id "$ORDER_TASK" \
+  --action pause \
+  --instruction-id order-pause \
+  --source-conversation captain-constraint-session \
+  --direction 'Pause the order-independence task.' >/dev/null
+run "$HOME_ORDER_A" hold \
+  --task-id "$ORDER_TASK" \
+  --decision-key order-financial-hold \
+  --boundaries financial-transaction \
+  --reason 'The financial boundary remains independently held.' >/dev/null
+
+run "$HOME_ORDER_B" hold \
+  --task-id "$ORDER_TASK" \
+  --decision-key order-financial-hold \
+  --boundaries financial-transaction \
+  --reason 'The financial boundary remains independently held.' >/dev/null
+run_session "$HOME_ORDER_B" record-captain-decision \
+  --task-id "$ORDER_TASK" \
+  --action pause \
+  --instruction-id order-pause \
+  --source-conversation captain-constraint-session \
+  --direction 'Pause the order-independence task.' >/dev/null
+
+ORDER_APPLIED_A=$(status_task "$HOME_ORDER_A" "$ORDER_TASK" | jq -Sc \
+  '.task | {state,progress_state,blockers,required:.authority.captain_required_boundaries}')
+ORDER_APPLIED_B=$(status_task "$HOME_ORDER_B" "$ORDER_TASK" | jq -Sc \
+  '.task | {state,progress_state,blockers,required:.authority.captain_required_boundaries}')
+[ "$ORDER_APPLIED_A" = "$ORDER_APPLIED_B" ] \
+  || fail "pause and hold application depended on command order"
+printf '%s' "$ORDER_APPLIED_A" | jq -e '
+  .state == "blocked" and .progress_state == "running" and
+  (.blockers | map(.kind) == ["captain-approval","captain-pause"]) and
+  .required == ["financial-transaction"]
+' >/dev/null || fail "pause then hold did not preserve both independent constraints"
+
+# Clear pause first in A and boundary first in B. Each decision clears only the
+# constraint it names, and either remaining constraint keeps the task blocked.
+run_session "$HOME_ORDER_A" record-captain-decision \
+  --task-id "$ORDER_TASK" \
+  --action narrow \
+  --instruction-id order-resume \
+  --source-conversation captain-constraint-session \
+  --direction 'Lift only the named captain pause.' \
+  --supersedes order-pause >/dev/null
+run_session "$HOME_ORDER_B" record-captain-decision \
+  --task-id "$ORDER_TASK" \
+  --action override \
+  --instruction-id order-authorize \
+  --source-conversation captain-constraint-session \
+  --direction 'Authorize only the financial boundary.' \
+  --authorized-boundaries financial-transaction >/dev/null
+
+status_task "$HOME_ORDER_A" "$ORDER_TASK" | jq -e '
+  .task.state == "blocked" and .task.progress_state == "running" and
+  (.task.blockers | map(.kind) == ["captain-approval"]) and
+  .task.authority.captain_required_boundaries == ["financial-transaction"]
+' >/dev/null || fail "pause semantics incidentally cleared the financial hold"
+status_task "$HOME_ORDER_B" "$ORDER_TASK" | jq -e '
+  .task.state == "blocked" and .task.progress_state == "running" and
+  (.task.blockers | map(.kind) == ["captain-pause"]) and
+  .task.authority.captain_required_boundaries == []
+' >/dev/null || fail "boundary authorization incidentally cleared the captain pause"
+if run "$HOME_ORDER_A" transition --task-id "$ORDER_TASK" --transition-key order-a-bypass --to running >/dev/null 2>&1; then
+  fail "task with a remaining boundary constraint reached running"
+fi
+if run "$HOME_ORDER_B" transition --task-id "$ORDER_TASK" --transition-key order-b-bypass --to running >/dev/null 2>&1; then
+  fail "task with a remaining pause constraint reached running"
+fi
+
+run_session "$HOME_ORDER_A" record-captain-decision \
+  --task-id "$ORDER_TASK" \
+  --action override \
+  --instruction-id order-authorize \
+  --source-conversation captain-constraint-session \
+  --direction 'Authorize only the financial boundary.' \
+  --authorized-boundaries financial-transaction >/dev/null
+run_session "$HOME_ORDER_B" record-captain-decision \
+  --task-id "$ORDER_TASK" \
+  --action narrow \
+  --instruction-id order-resume \
+  --source-conversation captain-constraint-session \
+  --direction 'Lift only the named captain pause.' \
+  --supersedes order-pause >/dev/null
+
+ORDER_CLEARED_A=$(status_task "$HOME_ORDER_A" "$ORDER_TASK" | jq -Sc \
+  '.task | {state,progress_state,blockers,required:.authority.captain_required_boundaries,authorized:.authority.captain_authorized_boundaries,accepted_at:.lifecycle_timestamps.accepted_at}')
+ORDER_CLEARED_B=$(status_task "$HOME_ORDER_B" "$ORDER_TASK" | jq -Sc \
+  '.task | {state,progress_state,blockers,required:.authority.captain_required_boundaries,authorized:.authority.captain_authorized_boundaries,accepted_at:.lifecycle_timestamps.accepted_at}')
+[ "$ORDER_CLEARED_A" = "$ORDER_CLEARED_B" ] \
+  || fail "constraint clearing depended on command order"
+printf '%s' "$ORDER_CLEARED_A" | jq -e '
+  .state == "running" and .progress_state == "running" and .blockers == [] and
+  .required == [] and .authorized == ["financial-transaction"] and .accepted_at != null
+' >/dev/null || fail "clearing every constraint did not restore the derived running state"
+pass "constraint apply and clear semantics are order-independent"
+
+# One decision may explicitly clear the named pause and one named boundary, but
+# an unrelated boundary remains a distinct constraint and still derives blocked.
+HOME_CONSTRAINT_PARTIAL="$TMP_ROOT/constraints-partial"
+PARTIAL_CONSTRAINT_TASK=15151515-1515-4515-8515-151515151515
+setup_running_task "$HOME_CONSTRAINT_PARTIAL" "$PARTIAL_CONSTRAINT_TASK" \
+  constraints-partial-event constraints-partial-v1 'Preserve unrelated authority constraints.'
+run_session "$HOME_CONSTRAINT_PARTIAL" record-captain-decision \
+  --task-id "$PARTIAL_CONSTRAINT_TASK" \
+  --action pause \
+  --instruction-id partial-pause \
+  --source-conversation captain-constraint-session \
+  --direction 'Pause while independent boundaries are assessed.' >/dev/null
+run "$HOME_CONSTRAINT_PARTIAL" hold \
+  --task-id "$PARTIAL_CONSTRAINT_TASK" \
+  --decision-key partial-multi-hold \
+  --boundaries financial-transaction,security-sensitive \
+  --reason 'Financial and security boundaries require separate captain authorization.' >/dev/null
+PARTIAL_ACCEPTED_AT=$(status_task "$HOME_CONSTRAINT_PARTIAL" "$PARTIAL_CONSTRAINT_TASK" | jq -r '.task.lifecycle_timestamps.accepted_at')
+run_session "$HOME_CONSTRAINT_PARTIAL" record-captain-decision \
+  --task-id "$PARTIAL_CONSTRAINT_TASK" \
+  --action override \
+  --instruction-id partial-financial-resume \
+  --source-conversation captain-constraint-session \
+  --direction 'Lift the named pause and authorize only the financial boundary.' \
+  --supersedes partial-pause \
+  --authorized-boundaries financial-transaction >/dev/null
+status_task "$HOME_CONSTRAINT_PARTIAL" "$PARTIAL_CONSTRAINT_TASK" | jq -e --arg accepted "$PARTIAL_ACCEPTED_AT" '
+  .task.state == "blocked" and .task.progress_state == "running" and
+  .task.lifecycle_timestamps.accepted_at == $accepted and
+  (.task.blockers | length == 1 and .[0].kind == "captain-approval" and .[0].boundaries == ["security-sensitive"]) and
+  .task.authority.captain_required_boundaries == ["security-sensitive"] and
+  .task.authority.captain_authorized_boundaries == ["financial-transaction"]
+' >/dev/null || fail "combined pause and boundary decision dropped an unrelated constraint or acceptance"
+run "$HOME_CONSTRAINT_PARTIAL" health | jq -e '.healthy == true' >/dev/null \
+  || fail "remaining constraint did not survive restart validation"
+pass "each constraint clears only through its own explicit semantics"
+
+# A delivered, unaccepted task with both constraints becomes accepted exactly
+# once when one captain decision names the pause and covers the held boundary.
+HOME_UNACCEPTED_CONSTRAINTS="$TMP_ROOT/constraints-unaccepted"
+setup_home "$HOME_UNACCEPTED_CONSTRAINTS"
+UNACCEPTED_CONSTRAINT_TASK=16161616-1616-4616-8616-161616161616
+append_mercury "$HOME_UNACCEPTED_CONSTRAINTS" "$UNACCEPTED_CONSTRAINT_TASK" \
+  constraints-unaccepted-event constraints-unaccepted-v1 'Accept only after explicit combined captain authority.'
+run "$HOME_UNACCEPTED_CONSTRAINTS" ingest >/dev/null
+run_session "$HOME_UNACCEPTED_CONSTRAINTS" record-captain-decision \
+  --task-id "$UNACCEPTED_CONSTRAINT_TASK" \
+  --action pause \
+  --instruction-id unaccepted-pause \
+  --source-conversation captain-constraint-session \
+  --direction 'Pause the delivered task.' >/dev/null
+run "$HOME_UNACCEPTED_CONSTRAINTS" hold \
+  --task-id "$UNACCEPTED_CONSTRAINT_TASK" \
+  --decision-key unaccepted-financial-hold \
+  --boundaries financial-transaction \
+  --reason 'The financial boundary requires explicit captain authorization.' >/dev/null
+run_session "$HOME_UNACCEPTED_CONSTRAINTS" record-captain-decision \
+  --task-id "$UNACCEPTED_CONSTRAINT_TASK" \
+  --action override \
+  --instruction-id unaccepted-covered-resume \
+  --source-conversation captain-constraint-session \
+  --direction 'Lift the pause and authorize this exact financial boundary.' \
+  --supersedes unaccepted-pause \
+  --authorized-boundaries financial-transaction \
+  --owner fm/constraint-worker >/dev/null
+status_task "$HOME_UNACCEPTED_CONSTRAINTS" "$UNACCEPTED_CONSTRAINT_TASK" | jq -e '
+  .task.state == "accepted" and .task.progress_state == "accepted" and
+  .task.lifecycle_timestamps.accepted_at != null and .task.blockers == [] and
+  .task.authority.captain_required_boundaries == []
+' >/dev/null || fail "covered unaccepted pause and hold did not derive explicit acceptance"
+pass "combined explicit captain semantics preserve acceptance instead of demoting lifecycle state"
 
 run "$HOME_ONE" transition \
   --task-id "$TASK_ONE" \

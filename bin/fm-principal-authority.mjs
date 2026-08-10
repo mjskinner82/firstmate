@@ -30,7 +30,7 @@ const RECEIPTS = join(STORE, "receipts");
 const DEFAULT_EVENTS = join(STATE, "hermes-ingress.events.jsonl");
 
 const CONFIG_SCHEMA = "fm-principal-authority-config.v1";
-const TASK_SCHEMA = "fm-principal-task.v1";
+const TASK_SCHEMA = "fm-principal-task.v2";
 const RECEIPT_SCHEMA = "fm-principal-receipt.v1";
 const STATUS_SCHEMA = "fm-principal-status.v1";
 const PRIORITIES = new Set(["low", "normal", "high", "urgent"]);
@@ -44,6 +44,7 @@ const LIFECYCLE_STATES = [
   "cancelled",
   "completed",
 ];
+const PROGRESS_STATES = new Set(LIFECYCLE_STATES.filter((state) => state !== "blocked"));
 const TERMINAL_STATES = new Set(["failed", "cancelled", "completed"]);
 const HIGHER_BOUNDARIES = new Set([
   "financial-transaction",
@@ -423,17 +424,111 @@ function recoverStore({ repair }) {
   return { receipts, tasks: materialized };
 }
 
+function constraintKey(constraint) {
+  if (constraint.kind === "captain-pause") return "captain-pause";
+  if (constraint.kind === "captain-approval") return `captain-approval:${constraint.boundaries[0]}`;
+  return `operational:${hashValue({ reason: constraint.reason, recorded_at: constraint.recorded_at })}`;
+}
+
+function normalizeConstraints(constraints) {
+  if (!Array.isArray(constraints) || constraints.length > 32) {
+    fail("task_drift", "task constraints must be an array of at most 32 members");
+  }
+  const normalized = constraints.map((constraint, index) => {
+    if (!constraint || typeof constraint !== "object" || Array.isArray(constraint)) {
+      fail("task_drift", `task constraint ${index} must be an object`);
+    }
+    if (constraint.kind === "captain-pause") {
+      exactKeys(constraint, new Set(["kind", "reason", "boundaries", "recorded_at", "instruction_id"]), `task constraint ${index}`);
+      boundedText(constraint.instruction_id, `task constraint ${index}.instruction_id`, 300);
+      if (!Array.isArray(constraint.boundaries) || constraint.boundaries.length !== 0) {
+        fail("task_drift", "captain-pause constraint must not carry authority boundaries");
+      }
+    } else if (constraint.kind === "captain-approval") {
+      exactKeys(constraint, new Set(["kind", "reason", "boundaries", "recorded_at"]), `task constraint ${index}`);
+      if (!Array.isArray(constraint.boundaries) || constraint.boundaries.length !== 1 || !HIGHER_BOUNDARIES.has(constraint.boundaries[0])) {
+        fail("task_drift", "captain-approval constraint must carry exactly one known higher boundary");
+      }
+    } else if (constraint.kind === "operational") {
+      exactKeys(constraint, new Set(["kind", "reason", "boundaries", "recorded_at"]), `task constraint ${index}`);
+      if (!Array.isArray(constraint.boundaries) || constraint.boundaries.length !== 0) {
+        fail("task_drift", "operational constraint must not carry authority boundaries");
+      }
+    } else {
+      fail("task_drift", `unknown task constraint kind: ${constraint.kind}`);
+    }
+    boundedText(constraint.reason, `task constraint ${index}.reason`, 12000);
+    if (!Number.isFinite(Date.parse(constraint.recorded_at))) {
+      fail("task_drift", `task constraint ${index}.recorded_at must be an ISO timestamp`);
+    }
+    return structuredClone(constraint);
+  });
+  const keys = normalized.map(constraintKey);
+  if (new Set(keys).size !== keys.length) fail("task_drift", "task constraint set contains a duplicate member");
+  return normalized.sort((left, right) => constraintKey(left).localeCompare(constraintKey(right)));
+}
+
+function addConstraints(current, additions) {
+  const constraints = new Map(normalizeConstraints(current).map((constraint) => [constraintKey(constraint), constraint]));
+  for (const constraint of normalizeConstraints(additions)) constraints.set(constraintKey(constraint), constraint);
+  return normalizeConstraints([...constraints.values()]);
+}
+
+function removeConstraints(current, predicate) {
+  return normalizeConstraints(normalizeConstraints(current).filter((constraint) => !predicate(constraint)));
+}
+
+function requiredBoundaries(constraints) {
+  return normalizeConstraints(constraints)
+    .filter((constraint) => constraint.kind === "captain-approval")
+    .map((constraint) => constraint.boundaries[0])
+    .sort();
+}
+
+function deriveLifecycleState(progressState, constraints) {
+  if (!PROGRESS_STATES.has(progressState)) fail("task_drift", `invalid task progress state: ${progressState}`);
+  return normalizeConstraints(constraints).length > 0 ? "blocked" : progressState;
+}
+
+function withDerivedTaskFields(task) {
+  const blockers = normalizeConstraints(task.blockers);
+  return {
+    ...task,
+    state: deriveLifecycleState(task.progress_state, blockers),
+    blockers,
+    authority: {
+      ...task.authority,
+      captain_required_boundaries: requiredBoundaries(blockers),
+    },
+  };
+}
+
 function validateTask(task) {
   if (task.schema !== TASK_SCHEMA || !UUID_RE.test(task.task_id || "") || !Number.isInteger(task.revision) || task.revision < 1) {
     fail("task_drift", "task has invalid schema, id, or revision");
   }
+  if (!PROGRESS_STATES.has(task.progress_state)) fail("task_drift", `task ${task.task_id} has an invalid progress state`);
   if (!LIFECYCLE_STATES.includes(task.state)) fail("task_drift", `task ${task.task_id} has an invalid lifecycle state`);
   if (task.objective_hash !== objectiveHash(task.objective)) fail("task_drift", `task ${task.task_id} objective fingerprint drifted`);
+  if (!Array.isArray(task.acceptance_criteria) || !Array.isArray(task.blockers) || !Array.isArray(task.artifacts) || !Array.isArray(task.verification)) {
+    fail("task_drift", `task ${task.task_id} has invalid bounded arrays`);
+  }
+  const normalized = normalizeConstraints(task.blockers);
+  if (asciiJson(task.blockers) !== asciiJson(normalized)) fail("task_drift", `task ${task.task_id} constraints are not canonical`);
+  const derivedState = deriveLifecycleState(task.progress_state, normalized);
+  if (task.state !== derivedState) fail("task_drift", `task ${task.task_id} lifecycle state does not match its constraint set`);
+  const boundaries = requiredBoundaries(normalized);
+  if (asciiJson(task.authority?.captain_required_boundaries) !== asciiJson(boundaries)) {
+    fail("task_drift", `task ${task.task_id} higher-boundary projection does not match its constraint set`);
+  }
   if (!task.lifecycle_timestamps || task.lifecycle_timestamps[`${task.state}_at`] === null) {
     fail("task_drift", `task ${task.task_id} current state lacks an explicit timestamp`);
   }
-  if (["running", "failed", "completed"].includes(task.state) && !task.lifecycle_timestamps.accepted_at) {
-    fail("acceptance_inferred", `task ${task.task_id} reached ${task.state} without explicit acceptance`);
+  if (task.lifecycle_timestamps[`${task.progress_state}_at`] === null) {
+    fail("task_drift", `task ${task.task_id} progress state lacks an explicit timestamp`);
+  }
+  if (["running", "failed", "completed"].includes(task.progress_state) && !task.lifecycle_timestamps.accepted_at) {
+    fail("acceptance_inferred", `task ${task.task_id} reached ${task.progress_state} progress without explicit acceptance`);
   }
   if (task.lifecycle_timestamps.accepted_at && !task.authority?.basis) {
     fail("acceptance_inferred", `task ${task.task_id} has accepted_at without an authority basis`);
@@ -441,29 +536,9 @@ function validateTask(task) {
   if (task.lifecycle_timestamps.accepted_at && !task.owner) {
     fail("task_drift", `task ${task.task_id} has explicit acceptance without an execution owner`);
   }
-  if (!Array.isArray(task.acceptance_criteria) || !Array.isArray(task.blockers) || !Array.isArray(task.artifacts) || !Array.isArray(task.verification)) {
-    fail("task_drift", `task ${task.task_id} has invalid bounded arrays`);
+  if (TERMINAL_STATES.has(task.progress_state) && normalized.length > 0) {
+    fail("task_drift", `terminal task ${task.task_id} retains active constraints`);
   }
-  if (hasEffectiveCaptainPause(task)) {
-    const pauseBlockers = task.blockers.filter((blocker) => blocker.kind === "captain-pause");
-    if (task.state !== "blocked" || pauseBlockers.length !== 1) {
-      fail("captain_precedence", `task ${task.task_id} does not preserve its effective captain pause`);
-    }
-  }
-  if (task.authority.captain_required_boundaries.length > 0) {
-    const approvalBlockers = task.blockers.filter((blocker) => blocker.kind === "captain-approval");
-    if (
-      task.state !== "blocked" ||
-      approvalBlockers.length !== 1 ||
-      asciiJson(approvalBlockers[0].boundaries) !== asciiJson(task.authority.captain_required_boundaries)
-    ) {
-      fail("captain_precedence", `task ${task.task_id} does not preserve its higher-boundary hold`);
-    }
-  }
-}
-
-function hasEffectiveCaptainPause(task) {
-  return task.effective_instruction?.principal === "captain" && task.effective_instruction.action === "pause";
 }
 
 function applyReceipt(base) {
@@ -474,13 +549,16 @@ function applyReceipt(base) {
 
 function transitionReceipt(task, options) {
   const timestamp = options.recordedAt || now();
-  const next = structuredClone(task);
+  let next = structuredClone(task);
   next.revision += 1;
-  next.state = options.to;
+  next.progress_state = options.progressState || (options.to === "blocked" ? task.progress_state : options.to);
   next.lifecycle_timestamps.updated_at = timestamp;
-  const timestampKey = `${options.to}_at`;
-  if (next.lifecycle_timestamps[timestampKey] === null) next.lifecycle_timestamps[timestampKey] = timestamp;
   options.mutate?.(next, timestamp);
+  next = withDerivedTaskFields(next);
+  const progressTimestampKey = `${next.progress_state}_at`;
+  if (next.lifecycle_timestamps[progressTimestampKey] === null) next.lifecycle_timestamps[progressTimestampKey] = timestamp;
+  const stateTimestampKey = `${next.state}_at`;
+  if (next.lifecycle_timestamps[stateTimestampKey] === null) next.lifecycle_timestamps[stateTimestampKey] = timestamp;
   validateTask(next);
   return applyReceipt({
     schema: RECEIPT_SCHEMA,
@@ -564,7 +642,7 @@ function sourceFromMercury(event) {
 }
 
 function makeBaseTask(event, source) {
-  return {
+  const task = {
     schema: TASK_SCHEMA,
     task_id: event.task_id,
     revision: 0,
@@ -586,7 +664,7 @@ function makeBaseTask(event, source) {
     acceptance_criteria: boundedList(event.acceptance_criteria, "acceptance_criteria", 20, 1000),
     repository: boundedText(event.repository_ref, "repository_ref", 500, { allowNewlines: false }),
     priority: event.priority,
-    state: "queued",
+    progress_state: "queued",
     lifecycle_timestamps: initialTimestamps(),
     owner: null,
     blockers: [],
@@ -609,6 +687,7 @@ function makeBaseTask(event, source) {
       source_conversation: source.conversation,
     },
   };
+  return withDerivedTaskFields(task);
 }
 
 function findTaskByObjective(tasks, hash) {
@@ -868,7 +947,6 @@ function commandAccept(flags) {
     operationHash: hashValue(operation),
     mutate(next) {
       next.owner = owner;
-      next.blockers = [];
       next.authority = {
         basis: "mercury-standing-ordinary-reversible",
         assessed_by: "firstmate",
@@ -908,8 +986,15 @@ function commandHold(flags) {
     mutate(next, timestamp) {
       next.authority.assessed_by = "firstmate";
       next.authority.assessment = reason;
-      next.authority.captain_required_boundaries = boundaries;
-      next.blockers = [{ kind: "captain-approval", reason, boundaries, recorded_at: timestamp }];
+      next.blockers = addConstraints(
+        next.blockers,
+        boundaries.map((boundary) => ({
+          kind: "captain-approval",
+          reason,
+          boundaries: [boundary],
+          recorded_at: timestamp,
+        })),
+      );
     },
   });
   process.stdout.write(`${asciiJson(publicReceipt(receipt), true)}\n`);
@@ -959,11 +1044,8 @@ function commandTransition(flags) {
   if (!task) fail("task_not_found", `task not found: ${taskId}`);
   if (!allowedTransition(task.state, to)) fail("invalid_transition", `task cannot transition from ${task.state} to ${to}`);
   if (!task.lifecycle_timestamps.accepted_at) fail("acceptance_inferred", `${to} requires an explicit accepted transition receipt`);
-  if (hasEffectiveCaptainPause(task) && to !== "blocked") {
-    fail("captain_precedence", "task cannot advance while a captain pause is effective");
-  }
-  if (task.authority.captain_required_boundaries.length > 0 && to !== "blocked") {
-    fail("captain_precedence", "task cannot advance while higher boundaries await the captain");
+  if (task.blockers.some((constraint) => ["captain-pause", "captain-approval"].includes(constraint.kind)) && to !== "blocked") {
+    fail("captain_precedence", "task cannot advance while a captain constraint is effective");
   }
   const receipt = transitionReceipt(task, {
     to,
@@ -974,8 +1056,11 @@ function commandTransition(flags) {
     operationHash: hashValue(operation),
     mutate(next, timestamp) {
       if (owner) next.owner = owner;
-      if (to === "blocked") next.blockers = [{ kind: "operational", reason, boundaries: [], recorded_at: timestamp }];
-      else next.blockers = [];
+      if (to === "blocked") {
+        next.blockers = addConstraints(next.blockers, [{ kind: "operational", reason, boundaries: [], recorded_at: timestamp }]);
+      } else {
+        next.blockers = removeConstraints(next.blockers, (constraint) => constraint.kind === "operational");
+      }
       if (artifacts.length > 0) next.artifacts = artifacts;
       if (verification.length > 0) next.verification = verification;
       if (["failed", "completed"].includes(to)) next.terminal_result = reason;
@@ -1237,35 +1322,60 @@ function commandRecordCaptainDecision(flags) {
   }
   const task = store.tasks.get(taskId);
   if (!task) fail("task_not_found", `task not found: ${taskId}`);
-  const supersedes = task.effective_instruction.instruction_id;
-  if (suppliedSupersedes && suppliedSupersedes !== supersedes) {
+  const currentInstruction = task.effective_instruction.instruction_id;
+  const pauseConstraint = task.blockers.find((constraint) => constraint.kind === "captain-pause") || null;
+  const validSupersessionTargets = new Set([currentInstruction, pauseConstraint?.instruction_id].filter(Boolean));
+  if (suppliedSupersedes && !validSupersessionTargets.has(suppliedSupersedes)) {
     fail("cross_task_authorization_rejected", "captain supersession reference does not match this task's current instruction");
   }
-  let to = task.state;
-  if (action === "pause") to = "blocked";
-  if (action === "cancel") to = "cancelled";
-  const hasHigherBoundaryHold = task.authority.captain_required_boundaries.length > 0;
-  const coversHold = task.authority.captain_required_boundaries.every((boundary) => authorized.includes(boundary));
-  if (["override", "narrow"].includes(action) && hasHigherBoundaryHold && coversHold) {
-    to = task.lifecycle_timestamps.accepted_at ? "running" : "accepted";
+  const changesDirection = ["override", "narrow"].includes(action);
+  const clearsCaptainPause = Boolean(
+    changesDirection && pauseConstraint && suppliedSupersedes === pauseConstraint.instruction_id,
+  );
+  let nextConstraints = task.blockers;
+  if (action === "pause") {
+    nextConstraints = addConstraints(task.blockers, [
+      {
+        kind: "captain-pause",
+        reason: direction,
+        boundaries: [],
+        recorded_at: now(),
+        instruction_id: instructionId,
+      },
+    ]);
+  } else if (action === "cancel") {
+    nextConstraints = [];
+  } else if (changesDirection) {
+    nextConstraints = removeConstraints(
+      task.blockers,
+      (constraint) =>
+        (constraint.kind === "captain-pause" && clearsCaptainPause) ||
+        (constraint.kind === "captain-approval" && authorized.includes(constraint.boundaries[0])),
+    );
   }
-  const clearsCaptainPause = task.blockers.some((blocker) => blocker.kind === "captain-pause");
-  if (["override", "narrow"].includes(action) && clearsCaptainPause && (!hasHigherBoundaryHold || coversHold)) {
-    to = task.lifecycle_timestamps.accepted_at ? "running" : "delivered";
-  }
-  if (["override", "narrow"].includes(action) && task.state === "delivered") to = "accepted";
-  if (to === "accepted" && !flags.owner && !task.owner) {
+  const remainingCaptainConstraints = nextConstraints.filter((constraint) =>
+    ["captain-pause", "captain-approval"].includes(constraint.kind),
+  );
+  const recordsAcceptance = Boolean(
+    changesDirection && !task.lifecycle_timestamps.accepted_at && remainingCaptainConstraints.length === 0,
+  );
+  let progressState = task.progress_state;
+  if (action === "cancel") progressState = "cancelled";
+  else if (recordsAcceptance) progressState = "accepted";
+  if (recordsAcceptance && !owner && !task.owner) {
     fail("usage", "--owner is required when direct captain direction accepts a delivered task");
   }
-  if (TERMINAL_STATES.has(task.state) && to !== task.state) fail("invalid_transition", "a terminal task cannot be reopened by this command");
+  if (TERMINAL_STATES.has(task.progress_state) && progressState !== task.progress_state) {
+    fail("invalid_transition", "a terminal task cannot be reopened by this command");
+  }
   const receipt = transitionReceipt(task, {
-    to,
+    to: progressState,
     receiptType: "captain-directive",
     idempotencyKey: `captain-record-decision:${instructionId}`,
     source: recorder,
     reason: direction,
     authority: { basis: "captain-direct", boundaries: authorized, action },
-    supersedesInstructionId: supersedes,
+    supersedesInstructionId: suppliedSupersedes || currentInstruction,
     notificationClass: "captain-direction",
     operationHash: hashValue(operation),
     mutate(next, timestamp) {
@@ -1278,24 +1388,20 @@ function commandRecordCaptainDecision(flags) {
         source_conversation: captainSource.conversation,
       };
       if (owner) next.owner = owner;
-      if (action === "pause") {
-        next.blockers = [
-          ...next.blockers.filter((blocker) => blocker.kind === "captain-approval"),
-          { kind: "captain-pause", reason: direction, boundaries: [], recorded_at: timestamp },
-        ];
-      } else if (action === "cancel") {
-        next.blockers = [];
-        next.authority.captain_required_boundaries = [];
+      next.blockers = nextConstraints.map((constraint) =>
+        constraint.kind === "captain-pause" && constraint.instruction_id === instructionId
+          ? { ...constraint, recorded_at: timestamp }
+          : constraint,
+      );
+      if (action === "cancel") {
         next.terminal_result = direction;
-      } else if (coversHold || to === "accepted") {
-        next.blockers = [];
-        next.authority.captain_required_boundaries = [];
-        next.authority.captain_authorized_boundaries = authorized;
+      } else if (changesDirection) {
+        next.authority.captain_authorized_boundaries = [
+          ...new Set([...next.authority.captain_authorized_boundaries, ...authorized]),
+        ].sort();
         next.authority.basis = "captain-direct";
         next.authority.assessed_by = "captain";
         next.authority.assessment = direction;
-      } else if (clearsCaptainPause) {
-        next.blockers = next.blockers.filter((blocker) => blocker.kind !== "captain-pause");
       }
     },
   });
@@ -1318,6 +1424,7 @@ function taskSummary(task) {
     acceptance_criteria: task.acceptance_criteria,
     repository: task.repository,
     priority: task.priority,
+    progress_state: task.progress_state,
     state: task.state,
     lifecycle_timestamps: task.lifecycle_timestamps,
     owner: task.owner,

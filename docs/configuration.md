@@ -53,6 +53,9 @@ Each `mercury_sources` entry allowlists one exact authenticated caller and ident
 Canonical task views live under `data/principal-authority/tasks/`, and content-addressed immutable receipts live under `data/principal-authority/receipts/`.
 Both directories and their files are private to the effective `FM_HOME` and survive process restart.
 The materialized task view is replayable from the contiguous receipt revisions, so a stopped write is recoverable without inventing lifecycle progress.
+Each task stores explicit `progress_state` and a canonical `blockers` constraint set.
+Captain pause, operational, and one-member-per-boundary captain approval constraints compose without replacement; the public lifecycle `state` and `captain_required_boundaries` are pure derived projections.
+Clearing one constraint never clears another, and any remaining constraint derives `blocked` regardless of application or clearing order.
 The short-lived writer lock lives at `state/.principal-authority.lock` and uses the same stale-owner recovery primitive as the wake queue.
 
 `bin/fm-principal-authority.sh` owns authenticated Mercury ingress, the exact event schema, lifecycle transitions, status, recovery, and refusal of all relay captain claims.

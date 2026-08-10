@@ -69,6 +69,12 @@ The principal task is the canonical authority record, while the ordinary fleet t
 Every move among queued, delivered, accepted, running, blocked, failed, cancelled, and completed must be an explicit recorded transition.
 Running, failed, and completed require a prior accepted receipt.
 Completion requires a result, at least one artifact, and at least one verification result.
+The task's `blockers` array is a canonical constraint set, not one replaceable blocker slot.
+Store one `captain-pause` member and one separate `captain-approval` member per held higher boundary; adding either kind preserves every unrelated constraint.
+Only a recorded captain override or narrowing that names the pause instruction may clear `captain-pause`.
+Only an explicit captain authorization naming a concrete boundary may clear that boundary's `captain-approval` member.
+The materialized `state` and `captain_required_boundaries` fields are pure projections of `progress_state` plus the constraint set, never command-assigned values.
+Any remaining constraint derives `blocked`, and applying or clearing constraints in another order must produce the same projection.
 Routine delivered, running, and operational-blocked transitions stay silent.
 Acceptance, a captain decision, and a terminal result are the low-noise notification classes.
 

@@ -17,8 +17,10 @@
 # Every mutating receipt embeds task_after. A retry or reboot can therefore
 # replay the highest contiguous receipt revision into the task view. Health
 # refuses receipt gaps, hash drift, duplicate objective records, and task-view
-# divergence. The portable lock from fm-wake-lib.sh serializes writers and
-# recovers stale owners after a stopped process or reboot.
+# divergence. Blockers are a canonical constraint set, while public state and
+# required boundaries derive purely from recorded progress plus that set. The
+# portable lock from fm-wake-lib.sh serializes writers and recovers stale owners
+# after a stopped process or reboot.
 #
 # Usage:
 #   fm-principal-authority.sh ingest [--events <jsonl>]
