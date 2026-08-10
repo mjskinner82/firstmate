@@ -42,7 +42,7 @@ The configuration has this exact versioned shape:
   "mercury_sources": [
     {
       "identity": "mercury",
-      "key_id": "mercury-firstmate-hmac-v1",
+      "key_id": "mercury-firstmate-signing-v1",
       "public_key_spki": "<base64 DER SubjectPublicKeyInfo>",
       "signature_algorithm": "ed25519"
     }
