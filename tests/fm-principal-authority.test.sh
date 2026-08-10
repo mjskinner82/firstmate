@@ -9,6 +9,16 @@ SESSION_INTERRUPT_DRIVER="$ROOT/tests/fm-principal-authority-session-driver.mjs"
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fm-principal-authority.XXXXXX")
 trap 'rm -rf "$TMP_ROOT"' EXIT
 NOW=2026-08-10T04:00:00.000Z
+KEYS=$(node --input-type=module -e '
+  import { generateKeyPairSync } from "node:crypto";
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  console.log(JSON.stringify({
+    privateKey: privateKey.export({ format: "der", type: "pkcs8" }).toString("base64"),
+    publicKey: publicKey.export({ format: "der", type: "spki" }).toString("base64"),
+  }));
+')
+MERCURY_PRIVATE_KEY=$(printf '%s' "$KEYS" | jq -r .privateKey)
+MERCURY_PUBLIC_KEY=$(printf '%s' "$KEYS" | jq -r .publicKey)
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "ok - $*"; }
@@ -34,17 +44,16 @@ run_interrupted_session() {
 setup_home() {
   local home=$1
   mkdir -p "$home/config" "$home/state"
-  cat > "$home/config/principal-authority.json" <<'JSON'
-{
-  "schema": "fm-principal-authority-config.v1",
-  "captain_sources": [
-    {"identity": "matt", "channel": "codex"}
-  ],
-  "mercury_sources": [
-    {"identity": "mercury", "key_id": "mercury-firstmate-hmac-v1"}
-  ]
-}
-JSON
+  jq -n --arg public_key "$MERCURY_PUBLIC_KEY" '{
+    schema:"fm-principal-authority-config.v2",
+    captain_sources:[{identity:"matt",channel:"codex"}],
+    mercury_sources:[{
+      identity:"mercury",
+      key_id:"mercury-firstmate-hmac-v1",
+      public_key_spki:$public_key,
+      signature_algorithm:"ed25519"
+    }]
+  }' > "$home/config/principal-authority.json"
   chmod 600 "$home/config/principal-authority.json"
   : > "$home/state/hermes-ingress.events.jsonl"
   chmod 600 "$home/state/hermes-ingress.events.jsonl"
@@ -54,9 +63,22 @@ sha256_text() {
   printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
 }
 
+sign_payload() {
+  MERCURY_PRIVATE_KEY="$MERCURY_PRIVATE_KEY" node --input-type=module -e '
+    import { createPrivateKey, sign } from "node:crypto";
+    import { readFileSync } from "node:fs";
+    const key = createPrivateKey({
+      key: Buffer.from(process.env.MERCURY_PRIVATE_KEY, "base64"),
+      format: "der",
+      type: "pkcs8",
+    });
+    process.stdout.write(sign(null, readFileSync(0), key).toString("base64"));
+  '
+}
+
 append_mercury() { # <home> <task-id> <event-seed> <idempotency> <objective>
   local home=$1 task_id=$2 event_seed=$3 idempotency=$4 objective=$5
-  local acceptance payload payload_hash event_id
+  local acceptance payload payload_hash payload_signature event_id
   acceptance='["Observable behavior is covered by focused tests.","The durable receipt remains available after restart."]'
   payload=$(jq -cnSa \
     --arg caller mercury \
@@ -75,16 +97,18 @@ append_mercury() { # <home> <task-id> <event-seed> <idempotency> <objective>
     --argjson acceptance "$acceptance" \
     '{acceptance_criteria:$acceptance,caller_identity:$caller,created_at:$created_at,event_id:$event_id,event_type:$event_type,idempotency_key:$idempotency,identity_key_id:$identity_key_id,objective:$objective,priority:$priority,repository_ref:$repository,source_channel:$channel,source_conversation_ref:$conversation,source_message_ref:$message,task_id:$task_id}')
   payload_hash=$(sha256_text "$payload")
+  payload_signature=$(printf '%s' "$payload" | sign_payload)
   event_id=$(sha256_text "$event_seed")
   jq -cn \
     --argjson acceptance "$acceptance" \
     --arg payload_hash "$payload_hash" \
+    --arg payload_signature "$payload_signature" \
     --arg event_id "$event_id" \
     --arg task_id "$task_id" \
     --arg idempotency "$idempotency" \
     --arg objective "$objective" \
     --arg message "$event_seed" \
-    '{acceptance_criteria:$acceptance,assignment_payload_hash:$payload_hash,authenticated_caller:"mercury",created_at:"2026-08-10T03:38:26.944Z",event_id:$event_id,event_type:"mercury_engineering_assignment",idempotency_key:$idempotency,identity_key_id:"mercury-firstmate-hmac-v1",objective:$objective,priority:"high",repository_ref:"firstmate",source_channel:"telegram",source_conversation_ref:"8617707440",source_message_ref:$message,task_id:$task_id}' \
+    '{acceptance_criteria:$acceptance,assignment_payload_hash:$payload_hash,assignment_signature:$payload_signature,authenticated_caller:"mercury",created_at:"2026-08-10T03:38:26.944Z",event_id:$event_id,event_type:"mercury_engineering_assignment",idempotency_key:$idempotency,identity_key_id:"mercury-firstmate-hmac-v1",objective:$objective,priority:"high",repository_ref:"firstmate",source_channel:"telegram",source_conversation_ref:"8617707440",source_message_ref:$message,task_id:$task_id}' \
     >> "$home/state/hermes-ingress.events.jsonl"
 }
 
@@ -134,7 +158,7 @@ printf '%s' "$STATUS" | jq -e '
     identity:"mercury",
     identity_key_id:"mercury-firstmate-hmac-v1",
     identity_verified:true,
-    verification:"upstream-hmac-and-local-payload-hash"
+    verification:"upstream-hmac-and-local-ed25519-signature"
   } and
   .task.lifecycle_timestamps.accepted_at == null and
   ([.receipts[].to_state] == ["queued","delivered"])
@@ -237,6 +261,25 @@ run "$HOME_TAMPER" status --refusals | jq -e '
 [ ! -e "$HOME_TAMPER/data/principal-authority/tasks/$TAMPER_TASK.json" ] \
   || fail "tampered Mercury payload created a canonical task"
 pass "Mercury caller, key id, and canonical payload integrity are all required"
+
+HOME_SIGNATURE="$TMP_ROOT/tampered-mercury-signature"
+setup_home "$HOME_SIGNATURE"
+SIGNATURE_TASK=78787878-7878-4787-8787-787878787878
+append_mercury "$HOME_SIGNATURE" "$SIGNATURE_TASK" signature-event signature-v1 'Implement a reversible signature test.'
+signature_event="$HOME_SIGNATURE/state/tampered-signature.jsonl"
+jq -c '.assignment_signature = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="' \
+  "$HOME_SIGNATURE/state/hermes-ingress.events.jsonl" > "$signature_event"
+mv "$signature_event" "$HOME_SIGNATURE/state/hermes-ingress.events.jsonl"
+chmod 600 "$HOME_SIGNATURE/state/hermes-ingress.events.jsonl"
+if run "$HOME_SIGNATURE" ingest >/dev/null 2>&1; then
+  fail "invalid Mercury producer signature was accepted"
+fi
+run "$HOME_SIGNATURE" status --refusals | jq -e '
+  .refusals | any(.reason_code == "mercury_identity_rejected")
+' >/dev/null || fail "invalid Mercury producer signature lacked a durable refusal receipt"
+[ ! -e "$HOME_SIGNATURE/data/principal-authority/tasks/$SIGNATURE_TASK.json" ] \
+  || fail "invalid Mercury producer signature created a canonical task"
+pass "Mercury producer signature is verified before task creation"
 
 HOME_TAMPER_TASK="$TMP_ROOT/tampered-mercury-task"
 setup_home "$HOME_TAMPER_TASK"
@@ -815,6 +858,52 @@ printf '%s' "$PARTIAL_STATUS" | jq -e '
   .receipts[2].source.conversation == "captain-session-after-reboot"
 ' >/dev/null || fail "captain submission replay did not preserve original and resumed session provenance"
 pass "partial captain submission replays bind task semantics across reboot, not session thread"
+
+HOME_SERIAL="$TMP_ROOT/shared-writer-lock"
+setup_home "$HOME_SERIAL"
+SERIAL_TASK=abababab-abab-4bab-8bab-abababababab
+SERIAL_READY="$HOME_SERIAL/lock-ready"
+FM_HOME="$HOME_SERIAL" FM_PRINCIPAL_NOW="$NOW" \
+  FM_PRINCIPAL_TEST_HOLD_MS=1200 FM_PRINCIPAL_TEST_LOCK_READY="$SERIAL_READY" \
+  node "$SESSION_INTERRUPT_DRIVER" record-captain-task \
+    --task-id "$SERIAL_TASK" \
+    --idempotency-key serial-captain-v1 \
+    --instruction-id serial-captain-instruction-1 \
+    --source-conversation captain-session-serial-first \
+    --objective 'Serialize every shared principal ledger writer.' \
+    --acceptance-json '["Every entrypoint shares one writer lock."]' \
+    --repository firstmate \
+    --priority normal \
+    --owner fm/captain-worker > "$HOME_SERIAL/first.out" &
+SERIAL_FIRST_PID=$!
+for _ in $(seq 1 40); do
+  [ -e "$SERIAL_READY" ] && break
+  sleep 0.05
+done
+[ -e "$SERIAL_READY" ] || fail "direct module writer did not acquire the shared lock"
+run_session "$HOME_SERIAL" record-captain-task \
+  --task-id "$SERIAL_TASK" \
+  --idempotency-key serial-captain-v1 \
+  --instruction-id serial-captain-instruction-1 \
+  --source-conversation captain-session-serial-second \
+  --objective 'Serialize every shared principal ledger writer.' \
+  --acceptance-json '["Every entrypoint shares one writer lock."]' \
+  --repository firstmate \
+  --priority normal \
+  --owner fm/captain-worker > "$HOME_SERIAL/second.out" &
+SERIAL_SECOND_PID=$!
+sleep 0.2
+kill -0 "$SERIAL_SECOND_PID" 2>/dev/null \
+  || fail "wrapper writer bypassed the direct module writer lock"
+wait "$SERIAL_FIRST_PID" || fail "direct module writer failed"
+wait "$SERIAL_SECOND_PID" || fail "serialized wrapper writer failed"
+SERIAL_STATUS=$(status_task "$HOME_SERIAL" "$SERIAL_TASK")
+printf '%s' "$SERIAL_STATUS" | jq -e '
+  .task.state == "accepted" and
+  ([.receipts[].revision] == [1,2,3]) and
+  ([.receipts[].to_state] == ["queued","delivered","accepted"])
+' >/dev/null || fail "serialized direct and wrapper writers diverged the receipt ledger"
+pass "direct and wrapper entrypoints share one writer lock"
 
 HOME_DUPLICATE_CAPTAIN="$TMP_ROOT/captain-duplicate-objective"
 setup_home "$HOME_DUPLICATE_CAPTAIN"

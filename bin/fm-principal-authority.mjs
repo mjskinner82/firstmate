@@ -6,13 +6,16 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readlinkSync,
   readFileSync,
   readdirSync,
   renameSync,
+  rmdirSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createPublicKey, randomUUID, verify } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -28,8 +31,9 @@ const STORE = join(DATA, "principal-authority");
 const TASKS = join(STORE, "tasks");
 const RECEIPTS = join(STORE, "receipts");
 const DEFAULT_EVENTS = join(STATE, "hermes-ingress.events.jsonl");
+const WRITER_LOCK = join(STATE, ".principal-authority.lock");
 
-const CONFIG_SCHEMA = "fm-principal-authority-config.v1";
+const CONFIG_SCHEMA = "fm-principal-authority-config.v2";
 const TASK_SCHEMA = "fm-principal-task.v2";
 const RECEIPT_SCHEMA = "fm-principal-receipt.v1";
 const STATUS_SCHEMA = "fm-principal-status.v1";
@@ -61,6 +65,7 @@ const HIGHER_BOUNDARIES = new Set([
 const MERCURY_EVENT_KEYS = new Set([
   "acceptance_criteria",
   "assignment_payload_hash",
+  "assignment_signature",
   "authenticated_caller",
   "created_at",
   "event_id",
@@ -116,6 +121,77 @@ function asciiJson(value, pretty = false) {
 
 function hashValue(value) {
   return createHash("sha256").update(asciiJson(value)).digest("hex");
+}
+
+function sleep(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function processIsAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+function lockOwner(lockPath) {
+  let ownerPath = lockPath;
+  try {
+    if (lstatSync(lockPath).isSymbolicLink()) ownerPath = resolve(dirname(lockPath), readlinkSync(lockPath));
+    const text = readFileSync(join(ownerPath, "pid"), "utf8").trim();
+    return { ownerPath, pid: Number(text), text };
+  } catch {
+    return { ownerPath, pid: null, text: null };
+  }
+}
+
+function removeStaleLock(lockPath, observed) {
+  const current = lockOwner(lockPath);
+  if (current.ownerPath !== observed.ownerPath || current.text !== observed.text) return;
+  if (processIsAlive(current.pid)) return;
+  try {
+    if (lstatSync(lockPath).isSymbolicLink()) {
+      unlinkSync(lockPath);
+      if (existsSync(current.ownerPath)) {
+        try { unlinkSync(join(current.ownerPath, "pid")); } catch {}
+        try { rmdirSync(current.ownerPath); } catch {}
+      }
+      return;
+    }
+    try { unlinkSync(join(lockPath, "pid")); } catch {}
+    rmdirSync(lockPath);
+  } catch {}
+}
+
+function acquireWriterLock() {
+  mkdirSync(STATE, { recursive: true, mode: 0o700 });
+  for (;;) {
+    try {
+      mkdirSync(WRITER_LOCK, { mode: 0o700 });
+      writeFileSync(join(WRITER_LOCK, "pid"), `${process.pid}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+      return;
+    } catch (error) {
+      if (error.code !== "EEXIST") {
+        try { rmdirSync(WRITER_LOCK); } catch {}
+        throw error;
+      }
+      const observed = lockOwner(WRITER_LOCK);
+      let ageMilliseconds = 0;
+      try { ageMilliseconds = Date.now() - statSync(WRITER_LOCK).mtimeMs; } catch {}
+      if (!processIsAlive(observed.pid) && ageMilliseconds >= 2000) removeStaleLock(WRITER_LOCK, observed);
+      sleep(100);
+    }
+  }
+}
+
+function releaseWriterLock() {
+  const owner = lockOwner(WRITER_LOCK);
+  if (owner.ownerPath !== WRITER_LOCK || owner.pid !== process.pid) return;
+  try { unlinkSync(join(WRITER_LOCK, "pid")); } catch {}
+  try { rmdirSync(WRITER_LOCK); } catch {}
 }
 
 function now() {
@@ -187,6 +263,16 @@ function boundedList(value, name, maximumItems, maximumLength) {
     fail("invalid_input", `${name} must contain 1 to ${maximumItems} items`);
   }
   return value.map((item, index) => boundedText(item, `${name}[${index}]`, maximumLength));
+}
+
+function decodeBase64(value, name, expectedLength) {
+  const text = boundedText(value, name, 1000, { allowNewlines: false });
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(text)) fail("invalid_input", `${name} must be canonical base64`);
+  const bytes = Buffer.from(text, "base64");
+  if (bytes.toString("base64") !== text || bytes.length !== expectedLength) {
+    fail("invalid_input", `${name} must encode exactly ${expectedLength} bytes`);
+  }
+  return bytes;
 }
 
 function parseJsonArray(value, name, { allowEmpty = true } = {}) {
@@ -287,10 +373,30 @@ function readConfig() {
     };
   });
   config.mercury_sources = config.mercury_sources.map((source, index) => {
-    exactKeys(source, new Set(["identity", "key_id"]), `mercury_sources[${index}]`);
+    exactKeys(source, new Set(["identity", "key_id", "public_key_spki", "signature_algorithm"]), `mercury_sources[${index}]`);
+    if (source.signature_algorithm !== "ed25519") {
+      fail("invalid_config", `mercury_sources[${index}].signature_algorithm must be ed25519`);
+    }
+    let publicKey;
+    try {
+      publicKey = createPublicKey({
+        key: decodeBase64(source.public_key_spki, `mercury_sources[${index}].public_key_spki`, 44),
+        format: "der",
+        type: "spki",
+      });
+    } catch (error) {
+      if (error instanceof AuthorityError) throw error;
+      fail("invalid_config", `mercury_sources[${index}].public_key_spki is not a valid public key`);
+    }
+    if (publicKey.asymmetricKeyType !== "ed25519") {
+      fail("invalid_config", `mercury_sources[${index}].public_key_spki must contain an Ed25519 key`);
+    }
     return {
       identity: boundedText(source.identity, `mercury_sources[${index}].identity`, 200),
       key_id: boundedText(source.key_id, `mercury_sources[${index}].key_id`, 200),
+      public_key: publicKey,
+      public_key_spki: source.public_key_spki,
+      signature_algorithm: source.signature_algorithm,
     };
   });
   return config;
@@ -299,6 +405,7 @@ function readConfig() {
 function validateMercurySource(config, identity, keyId) {
   const match = config.mercury_sources.some((source) => source.identity === identity && source.key_id === keyId);
   if (!match) fail("mercury_identity_rejected", "Mercury caller and identity key id are not allowlisted together");
+  return config.mercury_sources.find((source) => source.identity === identity && source.key_id === keyId);
 }
 
 function receiptPath(id) {
@@ -609,7 +716,7 @@ function validateMercuryEvent(config, event, lineNumber) {
   exactKeys(event, MERCURY_EVENT_KEYS, `Mercury event line ${lineNumber}`);
   if (!SHA256_RE.test(event.event_id || "")) fail("schema_drift", `Mercury event line ${lineNumber} has an invalid event_id`);
   if (!UUID_RE.test(event.task_id || "")) fail("schema_drift", `Mercury event line ${lineNumber} has an invalid task_id`);
-  validateMercurySource(config, event.authenticated_caller, event.identity_key_id);
+  const source = validateMercurySource(config, event.authenticated_caller, event.identity_key_id);
   boundedText(event.idempotency_key, "idempotency_key", 200, { allowNewlines: false });
   boundedText(event.objective, "objective", 12000);
   boundedList(event.acceptance_criteria, "acceptance_criteria", 20, 1000);
@@ -623,6 +730,10 @@ function validateMercuryEvent(config, event, lineNumber) {
   if (!SHA256_RE.test(event.assignment_payload_hash || "") || payloadHash !== event.assignment_payload_hash) {
     fail("mercury_identity_rejected", "Mercury assignment payload integrity check failed");
   }
+  const signature = decodeBase64(event.assignment_signature, "assignment_signature", 64);
+  if (!verify(null, Buffer.from(asciiJson(assignmentPayload(event))), source.public_key, signature)) {
+    fail("mercury_identity_rejected", "Mercury assignment signature verification failed");
+  }
   return payloadHash;
 }
 
@@ -632,12 +743,14 @@ function sourceFromMercury(event) {
     identity: event.authenticated_caller,
     identity_key_id: event.identity_key_id,
     identity_verified: true,
-    verification: "upstream-hmac-and-local-payload-hash",
+    verification: "upstream-hmac-and-local-ed25519-signature",
     channel: event.source_channel,
     conversation: event.source_conversation_ref,
     message: event.source_message_ref,
     event_id: event.event_id,
     assignment_payload_hash: event.assignment_payload_hash,
+    assignment_signature: event.assignment_signature,
+    signature_algorithm: "ed25519",
   };
 }
 
@@ -732,6 +845,9 @@ function ingestMercury(event, store) {
   const eventReceipts = store.receipts.filter((receipt) => receipt.source?.event_id === event.event_id);
   if (eventReceipts.some((receipt) => receipt.source?.assignment_payload_hash !== event.assignment_payload_hash)) {
     fail("replay_rejected", `event ${event.event_id} was replayed with different payload integrity`);
+  }
+  if (eventReceipts.some((receipt) => receipt.source?.assignment_signature !== event.assignment_signature)) {
+    fail("replay_rejected", `event ${event.event_id} was replayed with different signature evidence`);
   }
   const completedEventReceipt = eventReceipts.find(
     (receipt) => receipt.receipt_type === "duplicate-objective-refused" || receipt.to_state === "delivered",
@@ -1587,14 +1703,18 @@ function reportCliError(error) {
 }
 
 export function executeIngressCli(argv) {
+  acquireWriterLock();
   try {
     main(argv, "ingress");
   } catch (error) {
     reportCliError(error);
+  } finally {
+    releaseWriterLock();
   }
 }
 
 export function executeTrustedSessionCli(argv, hooks = {}) {
+  acquireWriterLock();
   const previous = runtimeHooks;
   runtimeHooks = Object.freeze({ ...hooks });
   try {
@@ -1603,6 +1723,7 @@ export function executeTrustedSessionCli(argv, hooks = {}) {
     reportCliError(error);
   } finally {
     runtimeHooks = previous;
+    releaseWriterLock();
   }
 }
 

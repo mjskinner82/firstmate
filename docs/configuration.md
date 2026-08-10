@@ -28,26 +28,31 @@ Ordinary dead-direct-report recovery is owned by `stuck-crewmate-recovery`, whil
 
 The optional dual-principal consumer is inert when `state/hermes-ingress.events.jsonl` is absent.
 When that event ledger exists, `config/principal-authority.json` is required as a regular mode-600 file owned by the current user.
-It contains Mercury admission identities and descriptive captain receipt provenance, not secrets.
-The Mercury HMAC secret remains exclusively with the upstream Hermes bridge and never enters Firstmate configuration, task data, receipts, logs, or model context.
+It contains Mercury admission identities, producer signing public keys, and descriptive captain receipt provenance, not secrets.
+The Mercury HMAC and Ed25519 signing secrets remain exclusively with the upstream Hermes bridge and never enter Firstmate configuration, task data, receipts, logs, or model context.
 
 The configuration has this exact versioned shape:
 
 ```json
 {
-  "schema": "fm-principal-authority-config.v1",
+  "schema": "fm-principal-authority-config.v2",
   "captain_sources": [
     { "identity": "matt", "channel": "codex" }
   ],
   "mercury_sources": [
-    { "identity": "mercury", "key_id": "mercury-firstmate-hmac-v1" }
+    {
+      "identity": "mercury",
+      "key_id": "mercury-firstmate-hmac-v1",
+      "public_key_spki": "<base64 DER SubjectPublicKeyInfo>",
+      "signature_algorithm": "ed25519"
+    }
   ]
 }
 ```
 
 `captain_sources` contains exactly one descriptive direct captain identity and channel pair for receipts recorded by Firstmate's trusted session.
 It is not an ingress allowlist and never authenticates caller-supplied data or ambient process state.
-Each `mercury_sources` entry allowlists one exact authenticated caller and identity key id pair produced by the Hermes bridge after HMAC verification.
+Each `mercury_sources` entry allowlists one exact authenticated caller and identity key id pair plus the Ed25519 public key that independently verifies its canonical assignment payload.
 `FM_PRINCIPAL_CONFIG` overrides the config path only for tests or specialized setup and is never an identity signal.
 
 Canonical task views live under `data/principal-authority/tasks/`, and content-addressed immutable receipts live under `data/principal-authority/receipts/`.
@@ -56,7 +61,7 @@ The materialized task view is replayable from the contiguous receipt revisions, 
 Each task stores explicit `progress_state` and a canonical `blockers` constraint set.
 Captain pause, operational, and one-member-per-boundary captain approval constraints compose without replacement; the public lifecycle `state` and `captain_required_boundaries` are pure derived projections.
 Clearing one constraint never clears another, and any remaining constraint derives `blocked` regardless of application or clearing order.
-The short-lived writer lock lives at `state/.principal-authority.lock` and uses the same stale-owner recovery primitive as the wake queue.
+The short-lived writer lock lives at `state/.principal-authority.lock`, is owned by the shared implementation behind every entrypoint, and recovers stale owners after process stop or reboot.
 
 `bin/fm-principal-authority.sh` owns authenticated Mercury ingress, the exact event schema, lifecycle transitions, status, recovery, and refusal of all relay captain claims.
 `bin/fm-principal-session-authority.sh` is the separate local administrative recorder for captain direction Firstmate already received in its trusted interactive session.

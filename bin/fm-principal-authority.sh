@@ -3,9 +3,10 @@
 #
 # Mercury ingress is accepted only from the mode-600 Hermes event ledger after
 # the upstream bridge has verified its HMAC. This consumer independently
-# requires the configured Mercury caller and key id, reconstructs the exact
-# canonical payload, and verifies assignment_payload_hash before recording any
-# task. Relayed captain text is always recorded as refused unverified input.
+# requires the configured Mercury caller, key id, and Ed25519 public key,
+# reconstructs the exact canonical payload, and verifies both its hash and
+# producer signature before recording any task. Relayed captain text is always
+# recorded as refused unverified input.
 # This relay-facing executable exposes no captain mutation or identity-admission
 # command. Direct captain decisions are recorded by Firstmate through the
 # separate local fm-principal-session-authority.sh administrative surface after
@@ -19,8 +20,8 @@
 # refuses receipt gaps, hash drift, duplicate objective records, and task-view
 # divergence. Blockers are a canonical constraint set, while public state and
 # required boundaries derive purely from recorded progress plus that set. The
-# portable lock from fm-wake-lib.sh serializes writers and recovers stale owners
-# after a stopped process or reboot.
+# shared implementation lock serializes every writer entrypoint and recovers
+# stale owners after a stopped process or reboot.
 #
 # Usage:
 #   fm-principal-authority.sh ingest [--events <jsonl>]
@@ -40,13 +41,4 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
-STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
-
-# shellcheck source=bin/fm-wake-lib.sh
-. "$SCRIPT_DIR/fm-wake-lib.sh"
-
-LOCK="$STATE/.principal-authority.lock"
-fm_lock_acquire_wait "$LOCK"
-trap 'fm_lock_release "$LOCK"' EXIT HUP INT TERM
-
 node "$SCRIPT_DIR/fm-principal-authority.mjs" "$@"
