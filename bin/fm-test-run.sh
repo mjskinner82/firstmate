@@ -139,7 +139,7 @@ family_for_basename() {
     fm-crew-state.test.sh|fm-decision-hold-lifecycle.test.sh|\
     fm-documentation-audiences.test.sh|fm-ensure-agents-md.test.sh|fm-git-lib.test.sh|fm-path-lib.test.sh|fm-timeout-lib.test.sh|fm-grok-harness.test.sh|\
     fm-kimi-harness.test.sh|fm-muse-harness.test.sh|fm-herdr-lab.test.sh|fm-lint.test.sh|\
-    fm-agent-grade.test.sh|fm-operational-input.test.sh|fm-pi-primary-types.test.sh|\
+    fm-agent-grade.test.sh|fm-operational-input.test.sh|fm-pi-primary-types.test.sh|fm-principal-authority.test.sh|\
     fm-send-popup-settle.test.sh|fm-send-settle.test.sh|\
     fm-subagent-pretool-check.test.sh|\
     fm-supervision-instructions.test.sh|fm-task-delivery.test.sh|\
@@ -411,6 +411,7 @@ tests/fm-pending-reply.test.sh 7328
 tests/fm-pi-primary-live-e2e.test.sh 19
 tests/fm-pi-watch-extension.test.sh 16386
 tests/fm-pr-check-security.test.sh 199573
+tests/fm-principal-authority.test.sh 4400
 tests/fm-procevent.test.sh 42789
 tests/fm-public-followup.test.sh 23365
 tests/fm-quota-array-dispatch-live-e2e.test.sh 19
@@ -849,6 +850,10 @@ families_for_changed_path() {
       ;;
     bin/fm-test-run.sh|bin/fm-test-isolation-proof.sh)
       printf '%s\n' pure-contract-unit
+      ;;
+    bin/fm-principal-authority.sh|bin/fm-principal-authority.mjs|.agents/skills/principal-authority/*)
+      printf '%s\n' pure-contract-unit
+      printf '%s\n' session-bootstrap
       ;;
     bin/backends/herdr*|bin/fm-herdr-lab.sh|tests/herdr-test-safety.sh)
       printf '%s\n' real-herdr-gated

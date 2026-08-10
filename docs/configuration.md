@@ -24,6 +24,41 @@ Wake, watcher, away-mode, and Relay-specific state mechanics remain with their n
 `AGENTS.md` retains the run-once and read-once operator rules, lock-refusal safety, installation consent, and direct-report recovery boundaries because those facts apply at every session start.
 Ordinary dead-direct-report recovery is owned by `stuck-crewmate-recovery`, while persistent-secondmate recovery is owned by `secondmate-provisioning`.
 
+## Dual-principal authority (config/principal-authority.json)
+
+The optional dual-principal consumer is inert when `state/hermes-ingress.events.jsonl` is absent.
+When that event ledger exists, `config/principal-authority.json` is required as a regular mode-600 file owned by the current user.
+It contains authority identities, not secrets.
+The Mercury HMAC secret remains exclusively with the upstream Hermes bridge and never enters Firstmate configuration, task data, receipts, logs, or model context.
+
+The configuration has this exact versioned shape:
+
+```json
+{
+  "schema": "fm-principal-authority-config.v1",
+  "captain_sources": [
+    { "identity": "matt", "channel": "codex" }
+  ],
+  "mercury_sources": [
+    { "identity": "mercury", "key_id": "mercury-firstmate-hmac-v1" }
+  ]
+}
+```
+
+Each `captain_sources` entry allowlists one exact direct captain identity and trusted channel pair.
+Each `mercury_sources` entry allowlists one exact authenticated caller and identity key id pair produced by the Hermes bridge after HMAC verification.
+`FM_PRINCIPAL_CONFIG` overrides the config path only for tests or specialized setup.
+
+Canonical task views live under `data/principal-authority/tasks/`, and content-addressed immutable receipts live under `data/principal-authority/receipts/`.
+Both directories and their files are private to the effective `FM_HOME` and survive process restart.
+The materialized task view is replayable from the contiguous receipt revisions, so a stopped write is recoverable without inventing lifecycle progress.
+The short-lived writer lock lives at `state/.principal-authority.lock` and uses the same stale-owner recovery primitive as the wake queue.
+
+`bin/fm-principal-authority.sh` owns the exact event schema, task schema, lifecycle transitions, receipt format, health contract, commands, and higher-boundary identifiers.
+The `principal-authority` agent-only skill owns the Firstmate decision procedure.
+Full locked session start consumes the event ledger and prints `PRINCIPAL_INGRESS:` while an authenticated assignment awaits explicit disposition or when identity, schema, receipt, or task-view drift prevents safe consumption.
+Detect-only and context re-emission paths never consume ingress.
+
 ## Pi Calm preference (config/calm)
 
 The Pi Calm extension stores the captain's home-local presentation choice in gitignored `config/calm` under the effective Firstmate home, resolved from `FM_HOME`, then `FM_ROOT_OVERRIDE`, then the tracked code root derived from the extension path, or under `FM_CONFIG_OVERRIDE` when that test and specialized-setup override is present.

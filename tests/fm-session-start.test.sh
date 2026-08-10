@@ -6,7 +6,7 @@
 # Coverage:
 #   - absent-file markers vs empty-but-present files in the context digest
 #   - the lock-refusal read-only path: banner leads, every mutating step is
-#     skipped (including bootstrap's five mutating sweeps, verified by their
+#     skipped (including bootstrap's seven mutating sweeps, verified by their
 #     ABSENCE), the digest still completes
 #   - output section ordering: the safety preamble leads unchanged, live fleet
 #     state precedes the curated memory a truncated tail may take, and the
@@ -38,6 +38,8 @@ set -u
 
 SESSION_START="$ROOT/bin/fm-session-start.sh"
 BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
+REAL_NODE=$(command -v node)
+REAL_JQ=$(command -v jq)
 TMP_ROOT=$(fm_test_tmproot fm-session-start-tests)
 SESSION_START_SECOND_MATE_ID="fmtest-sm-${TMP_ROOT##*.}"
 SESSION_START_SECOND_MATE_TMP="/tmp/fm-$SESSION_START_SECOND_MATE_ID"
