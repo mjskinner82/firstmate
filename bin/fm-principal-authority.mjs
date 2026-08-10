@@ -16,6 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createHash, createPublicKey, randomUUID, verify } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -127,13 +128,32 @@ function sleep(milliseconds) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
 
-function processIsAlive(pid) {
+function processIdentity(pid) {
   if (!Number.isSafeInteger(pid) || pid < 1) return false;
   try {
     process.kill(pid, 0);
-    return true;
   } catch (error) {
-    return error.code === "EPERM";
+    if (error.code !== "EPERM") return null;
+  }
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
+    const command = readFileSync(`/proc/${pid}/cmdline`).toString("hex");
+    if (fields.length >= 20 && /^\d+$/.test(fields[19]) && command) {
+      let boot = "";
+      try { boot = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(); } catch {}
+      return `boot-id=${boot || "unavailable"} proc-starttime=${fields[19]} cmdline-hex=${command}`;
+    }
+  } catch {}
+  try {
+    const output = execFileSync(
+      "ps",
+      ["-p", String(pid), "-o", "lstart=", "-o", "command="],
+      { encoding: "utf8", env: { ...process.env, LC_ALL: "C" }, stdio: ["ignore", "pipe", "ignore"] },
+    ).trim();
+    return output || null;
+  } catch {
+    return null;
   }
 }
 
@@ -142,36 +162,50 @@ function lockOwner(lockPath) {
   try {
     if (lstatSync(lockPath).isSymbolicLink()) ownerPath = resolve(dirname(lockPath), readlinkSync(lockPath));
     const text = readFileSync(join(ownerPath, "pid"), "utf8").trim();
-    return { ownerPath, pid: Number(text), text };
+    const identity = readFileSync(join(ownerPath, "pid-identity"), "utf8").trim();
+    return { ownerPath, pid: Number(text), identity, text };
   } catch {
-    return { ownerPath, pid: null, text: null };
+    return { ownerPath, pid: null, identity: null, text: null };
   }
+}
+
+function lockOwnerIsLive(owner) {
+  return Boolean(owner.identity) && processIdentity(owner.pid) === owner.identity;
 }
 
 function removeStaleLock(lockPath, observed) {
   const current = lockOwner(lockPath);
-  if (current.ownerPath !== observed.ownerPath || current.text !== observed.text) return;
-  if (processIsAlive(current.pid)) return;
+  if (
+    current.ownerPath !== observed.ownerPath ||
+    current.text !== observed.text ||
+    current.identity !== observed.identity
+  ) return;
+  if (lockOwnerIsLive(current)) return;
   try {
     if (lstatSync(lockPath).isSymbolicLink()) {
       unlinkSync(lockPath);
       if (existsSync(current.ownerPath)) {
         try { unlinkSync(join(current.ownerPath, "pid")); } catch {}
+        try { unlinkSync(join(current.ownerPath, "pid-identity")); } catch {}
         try { rmdirSync(current.ownerPath); } catch {}
       }
       return;
     }
     try { unlinkSync(join(lockPath, "pid")); } catch {}
+    try { unlinkSync(join(lockPath, "pid-identity")); } catch {}
     rmdirSync(lockPath);
   } catch {}
 }
 
 function acquireWriterLock() {
   mkdirSync(STATE, { recursive: true, mode: 0o700 });
+  const identity = processIdentity(process.pid);
+  if (!identity) fail("writer_lock_identity", "current process identity is unavailable");
   for (;;) {
     try {
       mkdirSync(WRITER_LOCK, { mode: 0o700 });
       writeFileSync(join(WRITER_LOCK, "pid"), `${process.pid}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+      writeFileSync(join(WRITER_LOCK, "pid-identity"), `${identity}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
       return;
     } catch (error) {
       if (error.code !== "EEXIST") {
@@ -181,7 +215,7 @@ function acquireWriterLock() {
       const observed = lockOwner(WRITER_LOCK);
       let ageMilliseconds = 0;
       try { ageMilliseconds = Date.now() - statSync(WRITER_LOCK).mtimeMs; } catch {}
-      if (!processIsAlive(observed.pid) && ageMilliseconds >= 2000) removeStaleLock(WRITER_LOCK, observed);
+      if (!lockOwnerIsLive(observed) && ageMilliseconds >= 2000) removeStaleLock(WRITER_LOCK, observed);
       sleep(100);
     }
   }
@@ -189,8 +223,13 @@ function acquireWriterLock() {
 
 function releaseWriterLock() {
   const owner = lockOwner(WRITER_LOCK);
-  if (owner.ownerPath !== WRITER_LOCK || owner.pid !== process.pid) return;
+  if (
+    owner.ownerPath !== WRITER_LOCK ||
+    owner.pid !== process.pid ||
+    owner.identity !== processIdentity(process.pid)
+  ) return;
   try { unlinkSync(join(WRITER_LOCK, "pid")); } catch {}
+  try { unlinkSync(join(WRITER_LOCK, "pid-identity")); } catch {}
   try { rmdirSync(WRITER_LOCK); } catch {}
 }
 

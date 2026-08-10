@@ -61,7 +61,7 @@ The materialized task view is replayable from the contiguous receipt revisions, 
 Each task stores explicit `progress_state` and a canonical `blockers` constraint set.
 Captain pause, operational, and one-member-per-boundary captain approval constraints compose without replacement; the public lifecycle `state` and `captain_required_boundaries` are pure derived projections.
 Clearing one constraint never clears another, and any remaining constraint derives `blocked` regardless of application or clearing order.
-The short-lived writer lock lives at `state/.principal-authority.lock`, is owned by the shared implementation behind every entrypoint, and recovers stale owners after process stop or reboot.
+The short-lived writer lock lives at `state/.principal-authority.lock`, is owned by the shared implementation behind every entrypoint, and binds PID plus OS process identity so stopped or PID-recycled owners recover safely.
 
 `bin/fm-principal-authority.sh` owns authenticated Mercury ingress, the exact event schema, lifecycle transitions, status, recovery, and refusal of all relay captain claims.
 `bin/fm-principal-session-authority.sh` is the separate local administrative recorder for captain direction Firstmate already received in its trusted interactive session.

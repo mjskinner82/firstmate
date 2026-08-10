@@ -903,7 +903,31 @@ printf '%s' "$SERIAL_STATUS" | jq -e '
   ([.receipts[].revision] == [1,2,3]) and
   ([.receipts[].to_state] == ["queued","delivered","accepted"])
 ' >/dev/null || fail "serialized direct and wrapper writers diverged the receipt ledger"
-pass "direct and wrapper entrypoints share one writer lock"
+pass "identity-bound writer lock respects a genuinely live holder"
+
+HOME_RECYCLED_PID="$TMP_ROOT/recycled-pid-lock"
+setup_home "$HOME_RECYCLED_PID"
+RECYCLED_LOCK="$HOME_RECYCLED_PID/state/.principal-authority.lock"
+mkdir "$RECYCLED_LOCK"
+printf '%s\n' "$$" > "$RECYCLED_LOCK/pid"
+printf '%s\n' 'stale-process-identity' > "$RECYCLED_LOCK/pid-identity"
+touch -t 202001010000 "$RECYCLED_LOCK"
+run "$HOME_RECYCLED_PID" status --pending > "$HOME_RECYCLED_PID/status.out" &
+RECYCLED_COMMAND_PID=$!
+for _ in $(seq 1 80); do
+  kill -0 "$RECYCLED_COMMAND_PID" 2>/dev/null || break
+  sleep 0.05
+done
+if kill -0 "$RECYCLED_COMMAND_PID" 2>/dev/null; then
+  kill "$RECYCLED_COMMAND_PID" 2>/dev/null || true
+  wait "$RECYCLED_COMMAND_PID" 2>/dev/null || true
+  fail "recycled PID impersonated a live writer lock owner"
+fi
+wait "$RECYCLED_COMMAND_PID" || fail "authority command failed after recycled-PID lock recovery"
+jq -e '.tasks == []' "$HOME_RECYCLED_PID/status.out" >/dev/null \
+  || fail "authority status was wrong after recycled-PID lock recovery"
+[ ! -e "$RECYCLED_LOCK" ] || fail "recycled-PID lock remained after command completion"
+pass "stale writer lock recovers when its PID was recycled"
 
 HOME_DUPLICATE_CAPTAIN="$TMP_ROOT/captain-duplicate-objective"
 setup_home "$HOME_DUPLICATE_CAPTAIN"
