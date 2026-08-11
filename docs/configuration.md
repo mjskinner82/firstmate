@@ -24,6 +24,54 @@ Wake, watcher, away-mode, and Relay-specific state mechanics remain with their n
 `AGENTS.md` retains the run-once and read-once operator rules, lock-refusal safety, installation consent, and direct-report recovery boundaries because those facts apply at every session start.
 Ordinary dead-direct-report recovery is owned by `stuck-crewmate-recovery`, while persistent-secondmate recovery is owned by `secondmate-provisioning`.
 
+## Dual-principal authority (config/principal-authority.json)
+
+The optional dual-principal consumer is inert when `state/hermes-ingress.events.jsonl` is absent.
+When that event ledger exists, `config/principal-authority.json` is required as a regular mode-600 file owned by the current user.
+It contains Mercury admission identities, producer signing public keys, and descriptive captain receipt provenance, not secrets.
+The Mercury HMAC and Ed25519 signing secrets remain exclusively with the upstream Hermes bridge and never enter Firstmate configuration, task data, receipts, logs, or model context.
+
+The configuration has this exact versioned shape:
+
+```json
+{
+  "schema": "fm-principal-authority-config.v2",
+  "captain_sources": [
+    { "identity": "matt", "channel": "codex" }
+  ],
+  "mercury_sources": [
+    {
+      "identity": "mercury",
+      "key_id": "mercury-firstmate-signing-v1",
+      "public_key_spki": "<base64 DER SubjectPublicKeyInfo>",
+      "signature_algorithm": "ed25519"
+    }
+  ]
+}
+```
+
+`captain_sources` contains exactly one descriptive direct captain identity and channel pair for receipts recorded by Firstmate's trusted session.
+It is not an ingress allowlist and never authenticates caller-supplied data or ambient process state.
+Each `mercury_sources` entry allowlists one exact authenticated caller and identity key id pair plus the Ed25519 public key that independently verifies its canonical assignment payload.
+`FM_PRINCIPAL_CONFIG` overrides the config path only for tests or specialized setup and is never an identity signal.
+
+Canonical task views live under `data/principal-authority/tasks/`, and content-addressed immutable receipts live under `data/principal-authority/receipts/`.
+Both directories and their files are private to the effective `FM_HOME` and survive process restart.
+The materialized task view is replayable from the contiguous receipt revisions, so a stopped write is recoverable without inventing lifecycle progress.
+Each task stores explicit `progress_state` and a canonical `blockers` constraint set.
+Captain pause, operational, and one-member-per-boundary captain approval constraints compose without replacement; the public lifecycle `state` and `captain_required_boundaries` are pure derived projections.
+Clearing one constraint never clears another, and any remaining constraint derives `blocked` regardless of application or clearing order.
+The short-lived writer lock lives at `state/.principal-authority.lock`, is owned by the shared implementation behind every entrypoint, and binds PID plus OS process identity so stopped or PID-recycled owners recover safely.
+
+`bin/fm-principal-authority.sh` owns authenticated Mercury ingress, the exact event schema, lifecycle transitions, status, recovery, and refusal of all relay captain claims.
+`bin/fm-principal-session-authority.sh` is the separate local administrative recorder for captain direction Firstmate already received in its trusted interactive session.
+It accepts no captain identity claim and shares the task schema, receipt format, writer lock, and higher-boundary identifiers with the ingress owner.
+Relay ingestion never invokes this local recorder.
+A process with local write authority to the private Firstmate home is already inside the filesystem trust boundary; the recorder must never be exposed as a relay or remote command endpoint.
+The `principal-authority` agent-only skill owns the Firstmate decision procedure.
+Full locked session start consumes the event ledger and prints `PRINCIPAL_INGRESS:` while an authenticated assignment awaits explicit disposition or when identity, schema, receipt, or task-view drift prevents safe consumption.
+Detect-only and context re-emission paths never consume ingress.
+
 ## Pi Calm preference (config/calm)
 
 The Pi Calm extension stores the captain's home-local presentation choice in gitignored `config/calm` under the effective Firstmate home, resolved from `FM_HOME`, then `FM_ROOT_OVERRIDE`, then the tracked code root derived from the extension path, or under `FM_CONFIG_OVERRIDE` when that test and specialized-setup override is present.

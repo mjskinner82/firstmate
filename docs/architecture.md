@@ -161,6 +161,13 @@ The helper's header owns the exact signal detection, relocated-home limitation, 
 Ship tasks change projects and ship by project mode (`no-mistakes`, `direct-PR`, or `local-only`); scout tasks leave standalone investigation reports at `data/<id>/report.md` and never push.
 The intake and authority contract in `AGENTS.md` owns when separate scout research is warranted.
 
+## Dual-principal authority boundary
+
+Optional Mercury ingress is an authority-admission layer before ordinary task dispatch, not a second fleet or execution path.
+`bin/fm-principal-authority.sh` owns authenticated relay admission and durable lifecycle mutation, while the separate local `bin/fm-principal-session-authority.sh` records captain direction Firstmate already received in its trusted interactive session.
+Both entrypoints serialize through one writer lock and materialize one canonical task view from immutable receipts, so restart recovery does not depend on a current harness thread.
+The [`principal-authority` skill](../.agents/skills/principal-authority/SKILL.md) owns the operating decision procedure, and the [configuration reference](configuration.md#dual-principal-authority-configprincipal-authorityjson) owns setup, current storage behavior, and supported limits.
+
 ## Dispatch profiles
 
 Crewmate and scout dispatch can stay on the static crewmate harness resolved by `config/crew-harness`, or it can use local dispatch profiles in `config/crew-dispatch.json`.

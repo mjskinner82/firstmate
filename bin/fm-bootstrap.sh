@@ -12,6 +12,7 @@
 #                 "CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>",
 #                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK: <detail>",
 #                 "PR_CHECK_MIGRATION: <private remediation>",
+#                 "PRINCIPAL_INGRESS: <authenticated direction or refusal diagnostic>",
 #                 "TANGLE: <remediation>",
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
 #                 "NUDGE_SECONDMATES: secondmate <id>: send failed: <reason>",
@@ -79,9 +80,10 @@
 #          refresh relays any completed fm-fleet-sync.sh output before the
 #          aggregate timeout skip line with timeout and elapsed seconds.
 #          Set FM_FLEET_PRUNE=0 to skip branch pruning during that refresh.
-#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the six MUTATING sweeps
-#          (PR-check migration, secondmate_sync, secondmate_liveness_sweep,
-#          secondmate_handoff_resume, x_mode_setup, fleet_sync) while still
+#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the seven MUTATING sweeps
+#          (PR-check migration, principal_authority_ingest, secondmate_sync,
+#          secondmate_liveness_sweep, secondmate_handoff_resume, x_mode_setup,
+#          fleet_sync) while still
 #          printing every read-only detect line
 #          above; the TANGLE line switches to advisory-only wording with no
 #          checkout command. Used by
@@ -1059,6 +1061,40 @@ startup_memory_budget_setup() {
   fi
 }
 
+principal_authority_ingest() {
+  local events output errors result pending refused
+  events="$STATE/hermes-ingress.events.jsonl"
+  [ -e "$events" ] || [ -L "$events" ] || return 0
+  output=$(mktemp "${TMPDIR:-/tmp}/fm-principal-ingress-out.XXXXXX" 2>/dev/null) || {
+    echo "PRINCIPAL_INGRESS: could not allocate bounded command output"
+    return 0
+  }
+  errors=$(mktemp "${TMPDIR:-/tmp}/fm-principal-ingress-err.XXXXXX" 2>/dev/null) || {
+    rm -f "$output"
+    echo "PRINCIPAL_INGRESS: could not allocate bounded diagnostic output"
+    return 0
+  }
+  if "$SCRIPT_DIR/fm-principal-authority.sh" ingest --events "$events" > "$output" 2> "$errors"; then
+    result=$(cat "$output" 2>/dev/null || true)
+    if ! printf '%s' "$result" | jq -e '.schema == "fm-principal-status.v1"' >/dev/null 2>&1; then
+      echo "PRINCIPAL_INGRESS: consumer returned an invalid summary"
+    else
+      pending=$(printf '%s' "$result" | jq -r '.pending // 0')
+      refused=$(printf '%s' "$result" | jq -r '.refused // 0')
+      if [ "$pending" -gt 0 ] 2>/dev/null; then
+        echo "PRINCIPAL_INGRESS: $pending authenticated direction(s) await explicit authority and lifecycle disposition; load principal-authority and run bin/fm-principal-authority.sh status --pending"
+      elif [ "$refused" -gt 0 ] 2>/dev/null; then
+        echo "BOOTSTRAP_INFO: principal ingress recorded $refused unverified relay refusal(s); no authority changed"
+      fi
+    fi
+  else
+    result=$(tail -n 1 "$errors" 2>/dev/null || true)
+    [ -n "$result" ] || result='consumer failed without a diagnostic'
+    echo "PRINCIPAL_INGRESS: $result"
+  fi
+  rm -f "$output" "$errors"
+}
+
 if [ "${1:-}" = "install" ]; then
   shift
   [ $# -gt 0 ] || { echo "usage: fm-bootstrap.sh install <tool>..." >&2; exit 1; }
@@ -1083,6 +1119,7 @@ fi
 if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ] && local_phase; then
   "$SCRIPT_DIR/fm-pr-check-migrate.sh" || true
   startup_memory_budget_setup
+  principal_authority_ingest
 fi
 
 # Local detection: presence, version floors, and configuration. Nothing here
