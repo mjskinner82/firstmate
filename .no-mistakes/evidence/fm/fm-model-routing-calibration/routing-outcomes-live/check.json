@@ -1,0 +1,1 @@
+{"schema": "fm-routing-check.v1", "check_id": "focused-cli", "grader_id": "independent-check", "criteria_ids": ["focused-check"], "task_id": "live-routing-evidence", "spawn_gen": "spawn-live-1", "attempt_id": "attempt-1", "acceptance_criteria_sha256": "586b3a6b8e3a5891c512cb591795cf6b4c85340caeb79c602cb787beaaa118eb", "passed": true, "exit_code": 0}

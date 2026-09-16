@@ -1,0 +1,336 @@
+SCENARIO 1: exact fresh receipt import and scorecard
+$ fm-routing-outcomes.py import --manifest /Users/mattskinner/.no-mistakes/evidence/01M2MH2FBCC7XDGP4P8TZK8GQH/routing-outcomes-live/manifest.json --store /Users/mattskinner/.no-mistakes/evidence/01M2MH2FBCC7XDGP4P8TZK8GQH/routing-outcomes-live/outcomes.jsonl --json
+{
+  "action": "created",
+  "attempt_id": "attempt-1",
+  "ok": true,
+  "record_sha256": "7fffdfff5cb817a7890dcccc55e21cf501667b5d5b87ec8660f4a02bc0739961",
+  "revision": 1,
+  "task_id": "live-routing-evidence"
+}
+exit: 0
+$ fm-routing-outcomes.py inspect --task live-routing-evidence --store /Users/mattskinner/.no-mistakes/evidence/01M2MH2FBCC7XDGP4P8TZK8GQH/routing-outcomes-live/outcomes.jsonl --json
+{
+  "attempts": [
+    {
+      "attempt_id": "attempt-1",
+      "billing": {
+        "actual_incremental_usd": 0,
+        "api_equivalent_usd": null,
+        "fixed_subscription_usd": 20,
+        "price_catalog_sha256": null,
+        "price_sources": [],
+        "unpriced_models": [
+          "gpt-5.6-luna"
+        ]
+      },
+      "category": "1",
+      "comparison": null,
+      "finished_at": "2030-01-01T00:01:00Z",
+      "grading": {
+        "acceptance_criteria": [
+          {
+            "id": "focused-check",
+            "text": "focused product check passes"
+          }
+        ],
+        "acceptance_criteria_sha256": "586b3a6b8e3a5891c512cb591795cf6b4c85340caeb79c602cb787beaaa118eb",
+        "defect_count": 0,
+        "final_result": "pass",
+        "first_pass": "pass",
+        "fix_count": 0,
+        "grader": {
+          "id": "independent-check",
+          "kind": "deterministic-check"
+        },
+        "independent": true,
+        "method": "deterministic",
+        "overhead": {
+          "actual_incremental_usd": 0,
+          "duration_ms": 3,
+          "tokens": null
+        },
+        "receipts": [
+          {
+            "artifact_sha256": "12696be3781c18aa7fe75d2859f84258c68dbbcdc1e93ddd0cc8136afe6d5e61",
+            "criteria_ids": [
+              "focused-check"
+            ],
+            "id": "focused-cli",
+            "kind": "test",
+            "passed": true
+          }
+        ],
+        "retry_count": 0
+      },
+      "handoff": null,
+      "native": {
+        "api": "openai-codex-responses",
+        "completeness": {
+          "attribution": "task-incarnation-entry",
+          "effort": "unknown",
+          "request_payload": "provisional-before-remaining-handlers",
+          "usage": "complete"
+        },
+        "effective_effort": null,
+        "effective_model": "gpt-5.6-luna",
+        "first_native_at": "2030-01-01T00:00:01Z",
+        "kind": "pi-session",
+        "last_native_at": "2030-01-01T00:00:03Z",
+        "models": [
+          {
+            "model": "gpt-5.6-luna",
+            "provider": "codex",
+            "service_tier": null,
+            "tokens": {
+              "cache_read": 10,
+              "cache_write": 0,
+              "input": 100,
+              "output": 20,
+              "reasoning": 5,
+              "total": 130
+            }
+          }
+        ],
+        "native_duration_ms": null,
+        "native_reported_cost_usd": 0.5,
+        "provider": "codex",
+        "request_count": 1,
+        "requested_model_receipt": "gpt-5.6-luna",
+        "response_count": 1,
+        "selected_effort_receipt": "max",
+        "session_id": "session-live",
+        "source_sha256": "0209e866d555796c8b4276a7bcd22496d42fc06aa215fe3d9cdcb89cc835b6f2",
+        "spawn_gen_receipt": "spawn-live-1",
+        "task_id_receipt": "live-routing-evidence",
+        "tokens": {
+          "cache_read": 10,
+          "cache_write": 0,
+          "input": 100,
+          "output": 20,
+          "reasoning": 5,
+          "total": 130
+        }
+      },
+      "outcome": "unresolved",
+      "phase": "measurement",
+      "quota": {
+        "after": {
+          "generated_at": "2030-01-01T00:02:00Z",
+          "provider": "codex",
+          "quota_semantics": {
+            "effectiveAvailability": [],
+            "status": "known"
+          },
+          "source_sha256": "d95736a361b75e98b0278ef403ee649ac99b3f9abe5b284a486bd5f6221b1d39",
+          "state": {
+            "stale": false,
+            "status": "fresh"
+          },
+          "windows": [
+            {
+              "id": "weekly",
+              "kind": "weekly",
+              "label": "week",
+              "percentRemaining": 95,
+              "resetsAt": "2030-01-02T00:00:00Z"
+            }
+          ]
+        },
+        "attempt_bracketed": true,
+        "attribution": "exclusive",
+        "before": {
+          "generated_at": "2030-01-01T00:00:00Z",
+          "provider": "codex",
+          "quota_semantics": {
+            "effectiveAvailability": [],
+            "status": "known"
+          },
+          "source_sha256": "e88711a45311c301ac5eb8fb5297897d39fd3dec06ce8d6fa5d703e64e0a889f",
+          "state": {
+            "stale": false,
+            "status": "fresh"
+          },
+          "windows": [
+            {
+              "id": "weekly",
+              "kind": "weekly",
+              "label": "week",
+              "percentRemaining": 100,
+              "resetsAt": "2030-01-02T00:00:00Z"
+            }
+          ]
+        },
+        "concurrent_activity": false,
+        "note": "Window deltas are never summed; shared and model windows may describe the same allowance use.",
+        "provider": "codex",
+        "reset_crossed": false,
+        "route_provider_binding": "exact-native-provider",
+        "snapshots_fresh": true,
+        "window_deltas": [
+          {
+            "after_percent_remaining": 95,
+            "attributed_consumption_percent_points": 5,
+            "before_percent_remaining": 100,
+            "reset_crossed": false,
+            "window_id": "weekly"
+          }
+        ]
+      },
+      "requirements": {
+        "effective_model": "gpt-5.6-luna"
+      },
+      "route": {
+        "auth_category": "subscription",
+        "context_tier": "all",
+        "harness": "pi",
+        "provider": "codex",
+        "requested_effort": "max",
+        "requested_model": "gpt-5.6-luna",
+        "service_tier": "standard"
+      },
+      "schema": "fm-routing-attempt.v1",
+      "spawn_gen": "spawn-live-1",
+      "started_at": "2030-01-01T00:00:00Z",
+      "task_binding": {
+        "harness": "pi",
+        "kind": "ship",
+        "spawn_gen": "spawn-live-1",
+        "task_id": "live-routing-evidence",
+        "task_meta_sha256": "aecf8437ee03cb1b6b02bcef433e7e6075b713cf2ab8555ab4766398e24383b8"
+      },
+      "task_id": "live-routing-evidence",
+      "task_shape": "code-change",
+      "time_ms": {
+        "end_to_end": 60000,
+        "handoff": null,
+        "human": null,
+        "model": 20,
+        "queue": 10,
+        "retry": null,
+        "review": 7,
+        "tool": 5
+      }
+    }
+  ],
+  "ok": true,
+  "task_id": "live-routing-evidence"
+}
+exit: 0
+$ fm-routing-outcomes.py scorecard --store /Users/mattskinner/.no-mistakes/evidence/01M2MH2FBCC7XDGP4P8TZK8GQH/routing-outcomes-live/outcomes.jsonl --shadow-store /Users/mattskinner/.no-mistakes/evidence/01M2MH2FBCC7XDGP4P8TZK8GQH/routing-outcomes-live/shadow.jsonl --format markdown
+# Model-routing scorecard
+
+Attempts: 1 across 1 tasks and 1 task incarnations.
+
+## Route and whole-session observations
+
+| Category | Task shape | Route / measurement / efficiency scope | n | Native-bound accepted | Input tokens | Output tokens | Actual incremental | Fixed subscription | Execution API-equivalent | End-to-end | Grader time | Uncertainty |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | code-change | pi/codex/gpt-5.6-luna/requested-only:max [auth=subscription, context=all, service=standard] (attempt-route; execution-only-partial) | 1 | 0 | 100 | 20 | 0 USD | 20 USD | unknown (+1 unknown) | 60000 ms | 3 ms | API-equivalent price unknown; effective effort unknown |
+
+## Individual task-linked observations
+
+| Task | Incarnation | Attempt | Route | Outcome | Outcome authority | Attribution | Measurement / efficiency scope | Elapsed | Execution API-equivalent | Grader time | Quota movement |
+|---|---|---|---|---|---|---|---|---:|---:|---:|---|
+| live-routing-evidence | spawn-live-1 | attempt-1 | pi/codex/gpt-5.6-luna/requested-only:max [auth=subscription, context=all, service=standard] | unresolved | native-task-incarnation | task-incarnation-entry | attempt-route; execution-only-partial | 60000 ms | unknown | 3 ms | attribution=exclusive; route_provider_binding=exact-native-provider; concurrent=false; snapshots_fresh=true; reset_crossed=false; attempt_bracketed=true; before_semantics=known; after_semantics=known; weekly: 100 -> 95; consumption=5 pp; reset_crossed=false |
+
+Accepted journey aggregation: deferred-retries-grading-handoffs-and-cross-incarnation.
+
+## Shadow recommendations
+
+- No shadow recommendations recorded.
+
+Descriptive execution-only partial attempt evidence and heuristic suggestions only. Accepted journeys, retries, grading, handoffs, and cross-incarnation totals are not aggregated; unknown fields stay outside known totals.
+exit: 0
+private_content_persisted: False
+
+SCENARIO 2: accepted Pi result with provisional effort is rejected
+$ fm-routing-outcomes.py import --manifest /Users/mattskinner/.no-mistakes/evidence/01M2MH2FBCC7XDGP4P8TZK8GQH/routing-outcomes-live/manifest-accepted.json --store /Users/mattskinner/.no-mistakes/evidence/01M2MH2FBCC7XDGP4P8TZK8GQH/routing-outcomes-live/outcomes.jsonl --json
+{"error": "accepted Pi outcome requires complete native provider, effective model, and effective effort evidence; record this receipt as unresolved", "ok": false}
+exit: 2
+
+SCENARIO 2B: stale quota snapshot keeps movement unattributed
+$ fm-routing-outcomes.py import --manifest /Users/mattskinner/.no-mistakes/evidence/01M2MH2FBCC7XDGP4P8TZK8GQH/routing-outcomes-live/manifest.json --store /Users/mattskinner/.no-mistakes/evidence/01M2MH2FBCC7XDGP4P8TZK8GQH/routing-outcomes-live/outcomes.jsonl --json
+{
+  "action": "updated",
+  "attempt_id": "attempt-1",
+  "ok": true,
+  "record_sha256": "51c6af01b2ae204901a8d115dd16ebe41233163403bf0c465e29cd9090aa0332",
+  "revision": 2,
+  "task_id": "live-routing-evidence"
+}
+exit: 0
+$ fm-routing-outcomes.py scorecard --store /Users/mattskinner/.no-mistakes/evidence/01M2MH2FBCC7XDGP4P8TZK8GQH/routing-outcomes-live/outcomes.jsonl --shadow-store /Users/mattskinner/.no-mistakes/evidence/01M2MH2FBCC7XDGP4P8TZK8GQH/routing-outcomes-live/shadow.jsonl --format markdown
+# Model-routing scorecard
+
+Attempts: 1 across 1 tasks and 1 task incarnations.
+
+## Route and whole-session observations
+
+| Category | Task shape | Route / measurement / efficiency scope | n | Native-bound accepted | Input tokens | Output tokens | Actual incremental | Fixed subscription | Execution API-equivalent | End-to-end | Grader time | Uncertainty |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | code-change | pi/codex/gpt-5.6-luna/requested-only:max [auth=subscription, context=all, service=standard] (attempt-route; execution-only-partial) | 1 | 0 | 100 | 20 | 0 USD | 20 USD | unknown (+1 unknown) | 60000 ms | 3 ms | API-equivalent price unknown; effective effort unknown; quota attribution unknown |
+
+## Individual task-linked observations
+
+| Task | Incarnation | Attempt | Route | Outcome | Outcome authority | Attribution | Measurement / efficiency scope | Elapsed | Execution API-equivalent | Grader time | Quota movement |
+|---|---|---|---|---|---|---|---|---:|---:|---:|---|
+| live-routing-evidence | spawn-live-1 | attempt-1 | pi/codex/gpt-5.6-luna/requested-only:max [auth=subscription, context=all, service=standard] | unresolved | native-task-incarnation | task-incarnation-entry | attempt-route; execution-only-partial | 60000 ms | unknown | 3 ms | attribution=exclusive; route_provider_binding=exact-native-provider; concurrent=false; snapshots_fresh=false; reset_crossed=false; attempt_bracketed=true; before_semantics=known; after_semantics=known; weekly: 100 -> 95; consumption=unknown pp; reset_crossed=false |
+
+Accepted journey aggregation: deferred-retries-grading-handoffs-and-cross-incarnation.
+
+## Shadow recommendations
+
+- No shadow recommendations recorded.
+
+Descriptive execution-only partial attempt evidence and heuristic suggestions only. Accepted journeys, retries, grading, handoffs, and cross-incarnation totals are not aggregated; unknown fields stay outside known totals.
+exit: 0
+$ fm-routing-outcomes.py import --manifest /Users/mattskinner/.no-mistakes/evidence/01M2MH2FBCC7XDGP4P8TZK8GQH/routing-outcomes-live/manifest.json --store /Users/mattskinner/.no-mistakes/evidence/01M2MH2FBCC7XDGP4P8TZK8GQH/routing-outcomes-live/outcomes.jsonl --json
+{
+  "action": "updated",
+  "attempt_id": "attempt-1",
+  "ok": true,
+  "record_sha256": "7fffdfff5cb817a7890dcccc55e21cf501667b5d5b87ec8660f4a02bc0739961",
+  "revision": 3,
+  "task_id": "live-routing-evidence"
+}
+exit: 0
+
+SCENARIO 3: shadow recommendation retains raw freshness and uncertainty
+$ fm-routing-outcomes.py shadow --manifest /Users/mattskinner/.no-mistakes/evidence/01M2MH2FBCC7XDGP4P8TZK8GQH/routing-outcomes-live/shadow-manifest.json --shadow-store /Users/mattskinner/.no-mistakes/evidence/01M2MH2FBCC7XDGP4P8TZK8GQH/routing-outcomes-live/shadow.jsonl --json
+{
+  "action": "created",
+  "decision_id": "decision-1",
+  "ok": true,
+  "record_sha256": "b8db64813b93ce9a192351c9ab98db8ac54a361367a33144e838f237c40c7326",
+  "revision": 1,
+  "task_id": "live-routing-evidence"
+}
+exit: 0
+$ fm-routing-outcomes.py scorecard --store /Users/mattskinner/.no-mistakes/evidence/01M2MH2FBCC7XDGP4P8TZK8GQH/routing-outcomes-live/outcomes.jsonl --shadow-store /Users/mattskinner/.no-mistakes/evidence/01M2MH2FBCC7XDGP4P8TZK8GQH/routing-outcomes-live/shadow.jsonl --format markdown
+# Model-routing scorecard
+
+Attempts: 1 across 1 tasks and 1 task incarnations.
+
+## Route and whole-session observations
+
+| Category | Task shape | Route / measurement / efficiency scope | n | Native-bound accepted | Input tokens | Output tokens | Actual incremental | Fixed subscription | Execution API-equivalent | End-to-end | Grader time | Uncertainty |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | code-change | pi/codex/gpt-5.6-luna/requested-only:max [auth=subscription, context=all, service=standard] (attempt-route; execution-only-partial) | 1 | 0 | 100 | 20 | 0 USD | 20 USD | unknown (+1 unknown) | 60000 ms | 3 ms | API-equivalent price unknown; effective effort unknown |
+
+## Individual task-linked observations
+
+| Task | Incarnation | Attempt | Route | Outcome | Outcome authority | Attribution | Measurement / efficiency scope | Elapsed | Execution API-equivalent | Grader time | Quota movement |
+|---|---|---|---|---|---|---|---|---:|---:|---:|---|
+| live-routing-evidence | spawn-live-1 | attempt-1 | pi/codex/gpt-5.6-luna/requested-only:max [auth=subscription, context=all, service=standard] | unresolved | native-task-incarnation | task-incarnation-entry | attempt-route; execution-only-partial | 60000 ms | unknown | 3 ms | attribution=exclusive; route_provider_binding=exact-native-provider; concurrent=false; snapshots_fresh=true; reset_crossed=false; attempt_bracketed=true; before_semantics=known; after_semantics=known; weekly: 100 -> 95; consumption=5 pp; reset_crossed=false |
+
+Accepted journey aggregation: deferred-retries-grading-handoffs-and-cross-incarnation.
+
+## Shadow recommendations
+
+- live-routing-evidence (1, code-change): pi/requested-only:codex/requested-only:gpt-5.6-luna/requested-only:max [auth=subscription, context=all, service=standard] - shadow-only heuristic. Shadow-only heuristic recommendation; it does not execute a route.
+  - pi/requested-only:codex/requested-only:gpt-5.6-luna/requested-only:max [auth=subscription, context=all, service=standard]: heuristic eligibility=pass; capability=pass; runway=pass; spendPriority=1.2; raw quota codex at 2030-01-01T00:00:00Z (weekly=100); freshness status=fresh, stale=false; native quota semantics={"effectiveAvailability":[],"status":"known"}. known headroom after fit gates Uncertainty: none observed.
+  - claude/requested-only:anthropic/requested-only:claude-sonnet-5/requested-only:high [auth=subscription, context=all, service=standard]: heuristic eligibility=unknown; capability=pass; runway=unknown; spendPriority=unknown; raw quota codex at 2030-01-01T00:02:00Z (weekly=unknown); freshness status=stale, stale=true; native quota semantics={"effectiveAvailability":[],"status":"known"}. unknown is not exhaustion Uncertainty: stale allowance evidence.
+
+Descriptive execution-only partial attempt evidence and heuristic suggestions only. Accepted journeys, retries, grading, handoffs, and cross-incarnation totals are not aggregated; unknown fields stay outside known totals.
+exit: 0

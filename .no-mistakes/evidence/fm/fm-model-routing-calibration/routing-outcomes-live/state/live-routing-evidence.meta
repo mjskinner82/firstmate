@@ -1,0 +1,4 @@
+endpoint_task_id=live-routing-evidence
+spawn_gen=spawn-live-1
+harness=pi
+kind=ship

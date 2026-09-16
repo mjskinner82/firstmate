@@ -1,0 +1,1 @@
+{"schemaVersion": 5, "generatedAt": "2030-01-01T00:02:00Z", "providers": [{"provider": "codex", "state": {"status": "fresh", "stale": false}, "windows": [{"id": "weekly", "label": "week", "kind": "weekly", "resetsAt": "2030-01-02T00:00:00Z", "percentRemaining": 95}], "quotaSemantics": {"status": "known", "effectiveAvailability": []}}]}
